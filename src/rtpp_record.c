@@ -93,6 +93,99 @@ static int get_hdr_size(const struct sockaddr *);
 #define PUB2PVT(pubp) \
   ((struct rtpp_record_channel *)((char *)(pubp) - offsetof(struct rtpp_record_channel, pub)))
 
+
+static int
+ropen_remote_ctor_pa(struct rtpp_record_channel *rrc, struct rtpp_log *log, char *rname, int is_rtcp)
+{
+  /*
+  struct sockaddr_in {
+    short            sin_family;   // e.g. AF_INET, AF_INET6
+    unsigned short   sin_port;     // e.g. htons(3490)
+    struct in_addr   sin_addr;     // see struct in_addr, below
+    char             sin_zero[8];  // zero this if you want to
+  };
+
+
+  struct sockaddr_in6 {
+    u_int16_t       sin6_family;   // address family, AF_INET6
+    u_int16_t       sin6_port;     // port number, Network Byte Order
+    u_int32_t       sin6_flowinfo; // IPv6 flow information
+    struct in6_addr sin6_addr;     // IPv6 address
+    u_int32_t       sin6_scope_id; // Scope ID
+  };*/
+    RTPP_LOG(log, RTPP_LOG_INFO, "rname value: %s", rname);
+    // pass over udp:
+    rname += 4;
+    struct sockaddr_storage raddr;
+    int retval = 0;
+    int port;
+    char sport[10];
+    int ntype = AF_INET;
+    char *s0 = strchr(rname, '[');
+    char *s1;
+    if (s0 != NULL) {
+      rname = s0 + 1;
+      s0 = strchr(rname, ']');
+      if (s0 == NULL) {
+        RTPP_LOG(log, RTPP_LOG_ERR, "malformed IPV6");
+        retval = 2;
+      }
+      ntype = AF_INET6;
+    }
+    else {
+      s0 = rname;
+    }
+
+    if (retval == 0) {
+      s1 = strchr(s0, ':');
+      if (s1 == NULL) {
+          RTPP_LOG(log, RTPP_LOG_ERR, "remote recording target specification should include port number");
+          retval = 3;
+      }
+      else {
+        if (ntype == AF_INET) {
+          s0 = s1;
+        }
+        port = atoi(s1+1);
+        if (port <= 0 || port > 65534) {
+            RTPP_LOG(log, RTPP_LOG_ERR, "invalid port in the remote recording target specification");
+            retval = 4;
+        }
+        else {
+          port += (is_rtcp ? 1 : 0);
+          sprintf(sport, "%d", port);
+          *s0 = '\0';
+          port = resolve(sstosa(&raddr), ntype, rname, sport, AI_PASSIVE);
+          *s0 = (ntype == AF_INET ? ':' : ']');
+          if (port != 0) {
+              RTPP_LOG(log, RTPP_LOG_ERR, "getaddrinfo: %s", gai_strerror(port));
+              retval = 5;
+          }
+          RTPP_LOG(log, RTPP_LOG_INFO, "resolve: %s %s %d", rname, sport, ntype);
+        }
+      }
+    }
+    
+    rrc->mode = MODE_REMOTE_RTP;
+    rrc->needspool = 0;
+    if (retval == 0) {
+      rrc->fd = socket(ntype, SOCK_DGRAM, 0);
+      if (rrc->fd == -1) {
+          RTPP_ELOG(log, RTPP_LOG_ERR, "ropen: can't create rtp socket");
+          retval = 6;
+      }
+      else {
+        if (connect(rrc->fd, sstosa(&raddr), SA_LEN(sstosa(&raddr))) == -1) {
+          close(rrc->fd);
+          RTPP_ELOG(log, RTPP_LOG_ERR, "ropen: can't connect socket");
+          retval = 7;
+        }
+      }
+    }
+    return ((retval == 0) ? 0 : -1);
+}
+
+#if 0
 static int
 ropen_remote_ctor_pa(struct rtpp_record_channel *rrc, struct rtpp_log *log,
   char *rname, int is_rtcp)
@@ -100,7 +193,7 @@ ropen_remote_ctor_pa(struct rtpp_record_channel *rrc, struct rtpp_log *log,
     char *cp, *tmp;
     int n, port;
     struct sockaddr_storage raddr;
-
+    RTPP_LOG(log, RTPP_LOG_INFO, "rname value: %s", rname);
     tmp = strdup(rname + 4);
     if (tmp == NULL) {
         RTPP_ELOG(log, RTPP_LOG_ERR, "can't allocate memory");
@@ -150,6 +243,8 @@ e1:
 e0:
     return (-1);
 }
+#endif // 0
+
 
 struct rtpp_record *
 rtpp_record_open(struct cfg *cf, struct rtpp_session *sp, char *rname, int orig,
@@ -161,6 +256,7 @@ rtpp_record_open(struct cfg *cf, struct rtpp_session *sp, char *rname, int orig,
     int rval, remote;
     pcap_hdr_t pcap_hdr;
 
+    // IPv4 : udp:1.2.3.4:4321
     remote = (rname != NULL && strncmp("udp:", rname, 4) == 0) ? 1 : 0;
 
     rrc = rtpp_rzmalloc(sizeof(*rrc), &rcnt);
