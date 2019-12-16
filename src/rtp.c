@@ -389,16 +389,16 @@ rtp_packet_dup(struct rtp_packet *dpkt, struct rtp_packet *spkt, int flags)
         csize -= spkt->parsed->data_size;
     }
     memcpy(dpkt, spkt, csize);
+    dpkt_full = (struct rtp_packet_full *)dpkt;
+    dpkt->wi = &(dpkt_full->pvt.wi);
     if (dpkt->parsed == NULL) {
         return;
     }
-    dpkt_full = (struct rtp_packet_full *)dpkt;
     drinfo = &(dpkt_full->pvt.rinfo);    
     spkt_full = (struct rtp_packet_full *)spkt;
     srinfo = &(spkt_full->pvt.rinfo);
     memcpy(drinfo, srinfo, sizeof(struct rtp_info));
     dpkt->parsed = drinfo;
-    dpkt->wi = &(dpkt_full->pvt.wi);
     if ((flags & RTPP_DUP_HDRONLY) != 0) {
         dpkt->size -= dpkt->parsed->data_size;
         dpkt->parsed->data_size = 0;
@@ -412,6 +412,9 @@ rtp_packet_alloc()
     struct rtp_packet_full *pkt;
 
     pkt = rtpp_zmalloc(sizeof(*pkt));
+    if (pkt == NULL) {
+        return (NULL);
+    }
     pkt->pub.wi = &pkt->pvt.wi;
 
     return &(pkt->pub);
