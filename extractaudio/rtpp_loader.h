@@ -34,7 +34,7 @@
 #include <sys/stat.h>
 
 struct rtpp_loader;
-struct streams;
+struct sessions;
 struct channels;
 struct rtpp_session_stat;
 struct eaud_crypto;
@@ -46,14 +46,18 @@ typedef struct pcap_hdr_s pcap_hdr_t;
 #define pcap_hdr_t_DEFINED 1
 #endif
 
+DEFINE_METHOD(rtpp_loader, rtpp_loader_scan, int, struct sessions *);
+DEFINE_METHOD(rtpp_loader, rtpp_loader_load, int, struct channels *,
+  struct rtpp_session_stat *, enum origin, struct eaud_crypto *);
+DEFINE_METHOD(rtpp_loader, rtpp_loader_dtor, void);
+
 struct rtpp_loader {
     int ifd;
     struct stat sb;
     unsigned char *ibuf;
-    int (*scan)(struct rtpp_loader *, struct streams *);
-    int (*load)(struct rtpp_loader *, struct channels *,
-      struct rtpp_session_stat *, enum origin, struct eaud_crypto *);
-    void (*destroy)(struct rtpp_loader *);
+    rtpp_loader_scan_t scan;
+    rtpp_loader_load_t load;
+    rtpp_loader_dtor_t destroy;
 
     union {
         struct {

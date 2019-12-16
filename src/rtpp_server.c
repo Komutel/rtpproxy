@@ -37,6 +37,7 @@
 #include <unistd.h>
 
 #include "rtp.h"
+#include "rtpp_time.h"
 #include "rtp_packet.h"
 #include "rtpp_types.h"
 #include "rtpp_mallocs.h"
@@ -67,8 +68,6 @@ struct rtpp_server_priv {
     int started;
 };
 
-#define PUB2PVT(pubp)      ((struct rtpp_server_priv *)((char *)(pubp) - offsetof(struct rtpp_server_priv, pub)))
-
 static void rtpp_server_dtor(struct rtpp_server_priv *);
 static struct rtp_packet *rtpp_server_get(struct rtpp_server *, double, int *);
 static uint32_t rtpp_server_get_ssrc(struct rtpp_server *);
@@ -87,28 +86,29 @@ static const struct rtpp_server_smethods rtpp_server_smethods = {
 };
 
 struct rtpp_server *
-rtpp_server_ctor(const char *name, rtp_type_t codec, int loop, int ptime)
+rtpp_server_ctor(struct rtpp_server_ctor_args *ap)
 {
     struct rtpp_server_priv *rp;
-    struct rtpp_refcnt *rcnt;
     int fd;
     char path[PATH_MAX + 1];
 
-    sprintf(path, "%s.%d", name, codec);
+    sprintf(path, "%s.%d", ap->name, ap->codec);
     fd = open(path, O_RDONLY);
-    if (fd == -1)
+    if (fd == -1) {
+        ap->result = RTPP_SERV_NOENT;
 	goto e0;
+    }
 
-    rp = rtpp_rzmalloc(sizeof(struct rtpp_server_priv), &rcnt);
+    rp = rtpp_rzmalloc(sizeof(struct rtpp_server_priv), PVT_RCOFFS(rp));
     if (rp == NULL) {
+        ap->result = RTPP_SERV_NOMEM;
 	goto e1;
     }
-    rp->pub.rcnt = rcnt;
 
     rp->dts = 0;
     rp->fd = fd;
-    rp->loop = (loop > 0) ? loop - 1 : loop;
-    rp->ptime = (ptime > 0) ? ptime : RTPS_TICKS_MIN;
+    rp->loop = (ap->loop > 0) ? ap->loop - 1 : ap->loop;
+    rp->ptime = (ap->ptime > 0) ? ap->ptime : RTPS_TICKS_MIN;
 
     rp->rtp = (rtp_hdr_t *)rp->buf;
     rp->rtp->version = 2;
@@ -116,7 +116,7 @@ rtpp_server_ctor(const char *name, rtp_type_t codec, int loop, int ptime)
     rp->rtp->x = 0;
     rp->rtp->cc = 0;
     rp->rtp->mbt = 1;
-    rp->rtp->pt = codec;
+    rp->rtp->pt = ap->codec;
     rp->rtp->ts = random() & 0xfffffffe;
     rp->rtp->seq = random() & 0xffff;
     rp->rtp->ssrc = random();
@@ -127,6 +127,7 @@ rtpp_server_ctor(const char *name, rtp_type_t codec, int loop, int ptime)
 
     CALL_SMETHOD(rp->pub.rcnt, attach, (rtpp_refcnt_dtor_t)&rtpp_server_dtor,
       rp);
+    ap->result = RTPP_SERV_OK;
     return (&rp->pub);
 e1:
     close(fd);
@@ -152,7 +153,7 @@ rtpp_server_get(struct rtpp_server *self, double dtime, int *rval)
     int hlen;
     struct rtpp_server_priv *rp;
 
-    rp = PUB2PVT(self);
+    PUB2PVT(self, rp);
 
     if (rp->started == 0 || (rp->btime + ((double)rp->dts / 1000.0) > dtime)) {
         *rval = RTPS_LATER;
@@ -213,7 +214,7 @@ rtpp_server_get(struct rtpp_server *self, double dtime, int *rval)
 	if (rp->loop == 0 || lseek(rp->fd, 0, SEEK_SET) == -1 ||
 	  read(rp->fd, pkt->data.buf + hlen, rlen) != rlen) {
 	    *rval = RTPS_EOF;
-            rtp_packet_free(pkt);
+            RTPP_OBJ_DECREF(pkt);
             return (NULL);
         }
 	if (rp->loop != -1)
@@ -239,7 +240,7 @@ rtpp_server_get_ssrc(struct rtpp_server *self)
 {
     struct rtpp_server_priv *rp;
 
-    rp = PUB2PVT(self);
+    PUB2PVT(self, rp);
     return (ntohl(rp->rtp->ssrc));
 }
 
@@ -248,7 +249,7 @@ rtpp_server_set_ssrc(struct rtpp_server *self, uint32_t ssrc)
 {
     struct rtpp_server_priv *rp;
 
-    rp = PUB2PVT(self);
+    PUB2PVT(self, rp);
     rp->rtp->ssrc = htonl(ssrc);
 }
 
@@ -257,7 +258,7 @@ rtpp_server_get_seq(struct rtpp_server *self)
 {
     struct rtpp_server_priv *rp;
 
-    rp = PUB2PVT(self);
+    PUB2PVT(self, rp);
     return (ntohs(rp->rtp->seq));
 }
 
@@ -266,7 +267,7 @@ rtpp_server_set_seq(struct rtpp_server *self, uint16_t seq)
 {
     struct rtpp_server_priv *rp;
 
-    rp = PUB2PVT(self);
+    PUB2PVT(self, rp);
     rp->rtp->seq = htons(seq);
 }
 
@@ -275,7 +276,7 @@ rtpp_server_start(struct rtpp_server *self, double dtime)
 {
     struct rtpp_server_priv *rp;
 
-    rp = PUB2PVT(self);
+    PUB2PVT(self, rp);
     RTPP_DBG_ASSERT(rp->started == 0);
     rp->btime = dtime;
     rp->started = 1;

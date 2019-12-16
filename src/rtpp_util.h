@@ -35,21 +35,23 @@
 
 #define	NOT(x)		(((x) == 0) ? 1 : 0)
 
-struct cfg;
+struct rtpp_cfg;
 
 /* Function prototypes */
 void seedrandom(void);
-int set_rlimits(struct cfg *);
-int drop_privileges(struct cfg *);
+int set_rlimits(const struct rtpp_cfg *);
+int drop_privileges(const struct rtpp_cfg *);
 char *rtpp_strsep(char **, const char *);
 int rtpp_daemon(int, int);
 int url_unquote(unsigned char *, int);
 int rtpp_get_sched_hz(void);
-long long rtpp_rlim_max(struct cfg *cf);
+long long rtpp_rlim_max(const struct rtpp_cfg *);
 #ifndef HAVE_STRLCPY
 size_t strlcpy(char *, const char *, size_t);
 #endif
-
+enum atoi_rval {ATOI_OK = 0, ATOI_NOTINT = -1, ATOI_OUTRANGE = -2};
+enum atoi_rval atoi_safe(const char *, int *);
+enum atoi_rval atoi_saferange(const char *, int *, int, int);
 
 /* Some handy/compat macros */
 #if !defined(INFTIM)

@@ -29,17 +29,19 @@
 #include <errno.h>
 #include <math.h>
 #include <syslog.h>
+#include <stdatomic.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "config.h"
 
 #define RTPP_LOG_ADVANCED 1
 
 #include "rtpp_log.h"
-#include "rtpp_cfg_stable.h"
+#include "rtpp_cfg.h"
 #ifdef RTPP_LOG_ADVANCED
 #include "rtpp_syslog_async.h"
 #endif
@@ -47,11 +49,16 @@
 #include "rtpp_mallocs.h"
 
 #ifdef RTPP_LOG_ADVANCED
-static int syslog_async_opened = 0;
+static atomic_int syslog_async_opened = ATOMIC_VAR_INIT(0);
 #endif
 static double iitime = 0.0;
 
 #define CALL_ID_NONE "GLOBAL"
+
+static struct {
+    atomic_uint next_ticket;
+    atomic_uint now_serving;
+} _log_lock = {ATOMIC_VAR_INIT(0), ATOMIC_VAR_INIT(0)};
 
 struct rtpp_log_inst {
     char *call_id;
@@ -64,7 +71,7 @@ struct rtpp_log_inst {
 };
 
 struct rtpp_log_inst *
-_rtpp_log_open(struct rtpp_cfg_stable *cf, const char *app, const char *call_id)
+_rtpp_log_open(const struct rtpp_cfg *cf, const char *app, const char *call_id)
 {
     const char *stritime;
     const char *tform;
@@ -77,9 +84,12 @@ _rtpp_log_open(struct rtpp_cfg_stable *cf, const char *app, const char *call_id)
     if (facility == -1)
 	facility = LOG_DAEMON;
 
-    if (cf->nodaemon == 0 && syslog_async_opened == 0) {
-	if (syslog_async_init(app, facility) == 0)
-	    syslog_async_opened = 1;
+    if (cf->nodaemon == 0 && atomic_load(&syslog_async_opened) == 0) {
+	if (syslog_async_init(app, facility) == 0) {
+	    atomic_store(&syslog_async_opened, 1);
+        } else {
+            return (NULL);
+        }
     }
 #endif
     rli = rtpp_zmalloc(sizeof(struct rtpp_log_inst));
@@ -106,13 +116,13 @@ _rtpp_log_open(struct rtpp_cfg_stable *cf, const char *app, const char *call_id)
     } else {
         rli->level = cf->log_level;
     }
-    rli->format_se[0] = "%s%s:%s:%s: ";
+    rli->format_se[0] = "%s%s:%s:%s:%d: ";
     rli->format_se[1] = "\n";
-    rli->eformat_se[0] = "%s%s:%s:%s: ";
+    rli->eformat_se[0] = "%s%s:%s:%s:%d: ";
     rli->eformat_se[1] = ": %s (%d)\n";
-    rli->format_sl[0] = "%s:%s:%s: ";
+    rli->format_sl[0] = "%s:%s:%s:%d: ";
     rli->format_sl[1] = NULL;
-    rli->eformat_sl[0] = "%s:%s:%s: ";
+    rli->eformat_sl[0] = "%s:%s:%s:%d: ";
     rli->eformat_sl[1] = ": %s (%d)";
     return (rli);
 }
@@ -211,9 +221,30 @@ ftime(struct rtpp_log_inst *rli, double ltime, char *buf, int buflen)
     }
 }
 
+static void
+_rtpp_log_lock(void)
+{
+    unsigned int my_ticket;
+
+    my_ticket = atomic_fetch_add_explicit(&(_log_lock.next_ticket), 1,
+      memory_order_acq_rel);
+    while (atomic_load_explicit(&(_log_lock.now_serving),
+      memory_order_acquire) != my_ticket) {
+        usleep(1);
+    }
+}
+
+static void
+_rtpp_log_unlock(void)
+{
+
+    atomic_fetch_add_explicit(&(_log_lock.now_serving), 1,
+      memory_order_release);
+}
+
 void
 _rtpp_log_write_va(struct rtpp_log_inst *rli, int level, const char *function,
-  const char *format, va_list ap)
+  int lnum, const char *format, va_list ap)
 {
     char rtpp_log_buff[2048];
     char rtpp_time_buff[32];
@@ -232,9 +263,9 @@ _rtpp_log_write_va(struct rtpp_log_inst *rli, int level, const char *function,
     }
 
 #ifdef RTPP_LOG_ADVANCED
-    if (syslog_async_opened != 0) {
+    if (atomic_load(&syslog_async_opened) != 0) {
         snprintf(rtpp_log_buff, sizeof(rtpp_log_buff), rli->format_sl[0],
-          strlvl(level), call_id, function);
+          strlvl(level), call_id, function, lnum);
         va_copy(apc, ap);
 	vsyslog_async(level, rtpp_log_buff, rli->format_sl[1], format, apc);
         va_end(apc);
@@ -245,25 +276,18 @@ _rtpp_log_write_va(struct rtpp_log_inst *rli, int level, const char *function,
 #endif
 
     ftime(rli, getdtime(), rtpp_time_buff, sizeof(rtpp_time_buff));
+    _rtpp_log_lock();
     fprintf(stderr, rli->format_se[0], rtpp_time_buff, strlvl(level),
-      call_id, function);
+      call_id, function, lnum);
     vfprintf(stderr, format, ap);
-    fprintf(stderr, rli->format_se[1]);
-}
-
-void
-_rtpp_log_write(struct rtpp_log_inst *rli, int level, const char *function, const char *format, ...)
-{
-    va_list ap;
-
-    va_start(ap, format);
-    _rtpp_log_write_va(rli, level, function, format, ap);
-    va_end(ap);
+    fprintf(stderr, "%s", rli->format_se[1]);
+    fflush(stderr);
+    _rtpp_log_unlock();
 }
 
 void
 _rtpp_log_ewrite_va(struct rtpp_log_inst *rli, int level, const char *function,
-  const char *format, va_list ap)
+  int lnum, const char *format, va_list ap)
 {
     char rtpp_log_buff[2048];
     char rtpp_time_buff[32];
@@ -283,12 +307,12 @@ _rtpp_log_ewrite_va(struct rtpp_log_inst *rli, int level, const char *function,
     }
 
 #ifdef RTPP_LOG_ADVANCED
-    if (syslog_async_opened != 0) {
+    if (atomic_load(&syslog_async_opened) != 0) {
         int nch, m;
 
         m = sizeof(rtpp_log_buff);
         nch = snprintf(rtpp_log_buff, m, rli->eformat_sl[0],
-          strlvl(level), call_id, function);
+          strlvl(level), call_id, function, lnum);
         nch += 1;
         post = " TRUNCATED! ";
         if (nch < m) {
@@ -305,20 +329,13 @@ _rtpp_log_ewrite_va(struct rtpp_log_inst *rli, int level, const char *function,
     }
 #endif
     ftime(rli, getdtime(), rtpp_time_buff, sizeof(rtpp_time_buff));
+    _rtpp_log_lock();
     fprintf(stderr, rli->eformat_se[0], rtpp_time_buff, strlvl(level), call_id,
-      function);
+      function, lnum);
     vfprintf(stderr, format, ap);
     fprintf(stderr, rli->eformat_se[1], strerror(errno), errno);
-}
-
-void
-_rtpp_log_ewrite(struct rtpp_log_inst *rli, int level, const char *function, const char *format, ...)
-{
-    va_list ap;
-
-    va_start(ap, format);
-    _rtpp_log_ewrite_va(rli, level, function, format, ap);
-    va_end(ap);
+    fflush(stderr);
+    _rtpp_log_unlock();
 }
 
 static struct {

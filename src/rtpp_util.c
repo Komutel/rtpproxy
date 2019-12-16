@@ -28,7 +28,6 @@
 
 #include <sys/time.h>
 #include <sys/types.h>
-#include <sys/sysctl.h>
 #include <sys/resource.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -40,12 +39,16 @@
 
 #include "config.h"
 
+#ifdef HAVE_SYS_SYSCTL_H
+#include <sys/sysctl.h>
+#endif
+
 #include "rtpp_log.h"
-#include "rtpp_cfg_stable.h"
-#include "rtpp_defines.h"
+#include "rtpp_cfg.h"
 #include "rtpp_util.h"
 #include "rtpp_types.h"
 #include "rtpp_log_obj.h"
+#include "rtpp_runcreds.h"
 
 void
 seedrandom(void)
@@ -67,37 +70,39 @@ seedrandom(void)
 }
 
 int
-set_rlimits(struct cfg *cf)
+set_rlimits(const struct rtpp_cfg *cfsp)
 {
     struct rlimit rlp;
 
     if (getrlimit(RLIMIT_CORE, &rlp) < 0) {
-        RTPP_ELOG(cf->stable->glog, RTPP_LOG_ERR, "getrlimit(RLIMIT_CORE)");
+        RTPP_ELOG(cfsp->glog, RTPP_LOG_ERR, "getrlimit(RLIMIT_CORE)");
         return (-1);
     }
     rlp.rlim_cur = RLIM_INFINITY;
     rlp.rlim_max = RLIM_INFINITY;
     if (setrlimit(RLIMIT_CORE, &rlp) < 0) {
-        RTPP_ELOG(cf->stable->glog, RTPP_LOG_ERR, "setrlimit(RLIMIT_CORE)");
+        RTPP_ELOG(cfsp->glog, RTPP_LOG_ERR, "setrlimit(RLIMIT_CORE)");
         return (-1);
     }
     return (0);
 }
 
 int
-drop_privileges(struct cfg *cf)
+drop_privileges(const struct rtpp_cfg *cfsp)
 {
 
-    if (cf->stable->run_gname != NULL) {
-	if (setgid(cf->stable->run_gid) != 0) {
-	    RTPP_ELOG(cf->stable->glog, RTPP_LOG_ERR, "can't set current group ID: %d", cf->stable->run_gid);
+    if (cfsp->runcreds->gname != NULL) {
+	if (setgid(cfsp->runcreds->gid) != 0) {
+	    RTPP_ELOG(cfsp->glog, RTPP_LOG_ERR, "can't set current group ID: %d",
+	      (int)cfsp->runcreds->gid);
 	    return -1;
 	}
     }
-    if (cf->stable->run_uname == NULL)
+    if (cfsp->runcreds->uname == NULL)
 	return 0;
-    if (setuid(cf->stable->run_uid) != 0) {
-	RTPP_ELOG(cf->stable->glog, RTPP_LOG_ERR, "can't set current user ID: %d", cf->stable->run_uid);
+    if (setuid(cfsp->runcreds->uid) != 0) {
+	RTPP_ELOG(cfsp->glog, RTPP_LOG_ERR, "can't set current user ID: %d",
+	  (int)cfsp->runcreds->uid);
 	return -1;
     }
     return 0;
@@ -151,6 +156,11 @@ rtpp_daemon(int nochdir, int noclose)
     int oerrno;
     int osa_ok;
 
+    if (!noclose) {
+        fd = open("/dev/null", O_RDWR, 0);
+        if (fd < 0)
+            return (-1);
+    }
     /* A SIGHUP may be thrown when the parent exits below. */
     sigemptyset(&sa.sa_mask);
     sa.sa_handler = SIG_IGN;
@@ -159,6 +169,8 @@ rtpp_daemon(int nochdir, int noclose)
 
     switch (fork()) {
     case -1:
+        if (!noclose)
+            close(fd);
         return (-1);
     case 0:
         break;
@@ -179,14 +191,20 @@ rtpp_daemon(int nochdir, int noclose)
     if (!nochdir)
         (void)chdir("/");
 
-    if (!noclose && (fd = open("/dev/null", O_RDWR, 0)) != -1) {
-        (void)dup2(fd, STDIN_FILENO);
-#if !defined(RTPP_DEBUG)
-        (void)dup2(fd, STDOUT_FILENO);
-        (void)dup2(fd, STDERR_FILENO);
-#endif
-        if (fd > 2)
+    if (!noclose) {
+        if (fd != STDIN_FILENO) {
+            if (dup2(fd, STDIN_FILENO) < 0) {
+                (void)close(fd);
+                return (-1);
+            }
             (void)close(fd);
+        }
+#if !defined(RTPP_DEBUG)
+        if (dup2(STDIN_FILENO, STDOUT_FILENO) < 0)
+            return (-1);
+        if (dup2(STDIN_FILENO, STDERR_FILENO) < 0)
+            return (-1);
+#endif
     }
     return (0);
 }
@@ -228,6 +246,35 @@ url_unquote(unsigned char *buf, int len)
     return (outlen);
 }
 
+enum atoi_rval
+atoi_safe(const char *s, int *res)
+{
+    int rval;
+    char *cp;
+
+    rval = strtol(s, &cp, 10);
+    if (cp == s || *cp != '\0') {
+        return (ATOI_NOTINT);
+    }
+    *res = rval;
+    return (ATOI_OK);
+}
+
+enum atoi_rval
+atoi_saferange(const char *s, int *res, int min, int max)
+{
+    int rval;
+
+    if (atoi_safe(s, &rval)) {
+        return (ATOI_NOTINT);
+    }
+    if (rval < min || (max >= min && rval > max)) {
+        return (ATOI_OUTRANGE);
+    }
+    *res = rval;
+    return (ATOI_OK);
+}
+
 #if defined(_SC_CLK_TCK) && !defined(__FreeBSD__)
 #if defined(LINUX_XXX)
 static int
@@ -249,6 +296,9 @@ rtpp_get_sched_hz_linux(void)
     buf[rlen] = '\0'; 
     n = strtol(buf, &cp, 10);
     if (cp == buf) {
+        return (-1);
+    }
+    if (n <= 0) {
         return (-1);
     }
     return ((int64_t)1000000000 / n);

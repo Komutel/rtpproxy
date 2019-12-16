@@ -60,9 +60,6 @@ static size_t rtpp_netaddr_get(struct rtpp_netaddr *, struct sockaddr *, size_t)
 static size_t rtpp_netaddr_sip_print(struct rtpp_netaddr *, char *, size_t,
   char);
 
-#define PUB2PVT(pubp) \
-  ((struct rtpp_netaddr_priv *)((char *)(pubp) - offsetof(struct rtpp_netaddr_priv, pub)))
-
 static const struct rtpp_netaddr_smethods rtpp_netaddr_smethods = {
     .set = &rtpp_netaddr_set,
     .isempty = &rtpp_netaddr_isempty,
@@ -78,13 +75,11 @@ struct rtpp_netaddr *
 rtpp_netaddr_ctor(void)
 {
     struct rtpp_netaddr_priv *pvt;
-    struct rtpp_refcnt *rcnt;
 
-    pvt = rtpp_rzmalloc(sizeof(struct rtpp_netaddr_priv), &rcnt);
+    pvt = rtpp_rzmalloc(sizeof(struct rtpp_netaddr_priv), PVT_RCOFFS(pvt));
     if (pvt == NULL) {
         goto e0;
     }
-    pvt->pub.rcnt = rcnt;
     if (pthread_mutex_init(&pvt->lock, NULL) != 0) {
         goto e1;
     }
@@ -94,7 +89,7 @@ rtpp_netaddr_ctor(void)
     return ((&pvt->pub));
 
 e1:
-    CALL_SMETHOD(pvt->pub.rcnt, decref);
+    RTPP_OBJ_DECREF(&(pvt->pub));
     free(pvt);
 e0:
     return (NULL);
@@ -105,7 +100,7 @@ rtpp_netaddr_set(struct rtpp_netaddr *self, const struct sockaddr *addr, size_t 
 {
     struct rtpp_netaddr_priv *pvt;
 
-    pvt = PUB2PVT(self);
+    PUB2PVT(self, pvt);
     RTPP_DBG_ASSERT(alen <= sizeof(pvt->sas));
 
     pthread_mutex_lock(&pvt->lock);
@@ -129,7 +124,7 @@ rtpp_netaddr_isempty(struct rtpp_netaddr *self)
     struct rtpp_netaddr_priv *pvt;
     int rval;
 
-    pvt = PUB2PVT(self);
+    PUB2PVT(self, pvt);
     pthread_mutex_lock(&pvt->lock);
     rval = (pvt->rlen == 0);
     pthread_mutex_unlock(&pvt->lock);
@@ -142,7 +137,7 @@ rtpp_netaddr_cmp(struct rtpp_netaddr *self, const struct sockaddr *sap, size_t s
     struct rtpp_netaddr_priv *pvt;
     int rval;
 
-    pvt = PUB2PVT(self);
+    PUB2PVT(self, pvt);
     RTPP_DBG_ASSERT(salen <= sizeof(pvt->sas));
     pthread_mutex_lock(&pvt->lock);
     if (salen != pvt->rlen) {
@@ -161,7 +156,7 @@ rtpp_netaddr_isaddrseq(struct rtpp_netaddr *self, const struct sockaddr *sap)
     struct rtpp_netaddr_priv *pvt;
     int rval;
 
-    pvt = PUB2PVT(self);
+    PUB2PVT(self, pvt);
     pthread_mutex_lock(&pvt->lock);
     RTPP_DBG_ASSERT(pvt->rlen > 0);
     rval = isaddrseq(sstosa(&pvt->sas), sap);
@@ -175,7 +170,7 @@ rtpp_netaddr_cmphost(struct rtpp_netaddr *self, const struct sockaddr *sap)
     struct rtpp_netaddr_priv *pvt;
     int rval;
 
-    pvt = PUB2PVT(self);
+    PUB2PVT(self, pvt);
     pthread_mutex_lock(&pvt->lock);
     RTPP_DBG_ASSERT(pvt->rlen > 0);
     rval = ishostseq(sstosa(&pvt->sas), sap);
@@ -198,7 +193,7 @@ rtpp_netaddr_get(struct rtpp_netaddr *self, struct sockaddr *sap, size_t salen)
 {
     struct rtpp_netaddr_priv *pvt;
 
-    pvt = PUB2PVT(self);
+    PUB2PVT(self, pvt);
     pthread_mutex_lock(&pvt->lock);
     RTPP_DBG_ASSERT((salen >= pvt->rlen) && (pvt->rlen > 0));
     memcpy(sap, &pvt->sas, pvt->rlen);
@@ -213,7 +208,7 @@ rtpp_netaddr_sip_print(struct rtpp_netaddr *self, char *buf, size_t blen,
     char *rval;
     struct rtpp_netaddr_priv *pvt;
 
-    pvt = PUB2PVT(self);
+    PUB2PVT(self, pvt);
     pthread_mutex_lock(&pvt->lock);
     RTPP_DBG_ASSERT(pvt->rlen > 0);
     rval = addrport2char_r(sstosa(&pvt->sas), buf, blen, portsep);

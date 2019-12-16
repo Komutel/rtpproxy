@@ -66,6 +66,7 @@
 #define G722_ENABLED 0
 #endif
 
+#include "rtpp_endian.h"
 #include "rtp.h"
 
 #if BYTE_ORDER == BIG_ENDIAN
@@ -118,6 +119,8 @@ int main(int argc, char **argv)
         switch (ch) {
         case 'l':
             limit = atoi(optarg);
+            if (limit <= 0)
+                errx(1, "limit parameter have to be a number greater than zero");
             break;
 
         case 'L':
@@ -171,7 +174,8 @@ int main(int argc, char **argv)
     for (k = 0; efiles[k].pt != RTP_UNKN; k++) {
         if (efiles[k].enabled == 0)
             continue;
-        sprintf(efiles[k].path, "%s.%d", template, efiles[k].pt);
+        snprintf(efiles[k].path, sizeof(efiles[k].path), "%s.%d", template,
+          efiles[k].pt);
         efiles[k].f = fopen(efiles[k].path, "w");
         if (efiles[k].f == NULL)
             err(1, "can't open %s for writing", efiles[k].path);

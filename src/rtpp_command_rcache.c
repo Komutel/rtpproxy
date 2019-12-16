@@ -25,6 +25,10 @@
  *
  */
 
+#if defined(HAVE_CONFIG_H)
+#include "config_pp.h"
+#endif
+
 #include <stdlib.h>
 #include <string.h>
 
@@ -36,6 +40,7 @@
 #include "rtpp_refcnt.h"
 #include "rtpp_timed.h"
 #include "rtpp_timed_task.h"
+#include "rtpp_util.h"
 
 #define	RTPP_RCACHE_CPERD	3.0
 
@@ -50,6 +55,9 @@ struct rtpp_cmd_rcache_pvt {
 struct rtpp_cmd_rcache_entry {
     char *reply;
     double etime;
+    struct {
+        struct rtpp_refcnt *rcnt;
+    } pub;
 };
 
 static enum rtpp_timed_cb_rvals rtpp_cmd_rcache_cleanup(double, void *);
@@ -64,13 +72,11 @@ struct rtpp_cmd_rcache *
 rtpp_cmd_rcache_ctor(struct rtpp_timed *rtpp_timed_cf, double min_ttl)
 {
     struct rtpp_cmd_rcache_pvt *pvt;
-    struct rtpp_refcnt *rcnt;
 
-    pvt = rtpp_rzmalloc(sizeof(struct rtpp_cmd_rcache_pvt), &rcnt);
+    pvt = rtpp_rzmalloc(sizeof(struct rtpp_cmd_rcache_pvt), PVT_RCOFFS(pvt));
     if (pvt == NULL) {
         return (NULL);
     }
-    pvt->pub.rcnt = rcnt;
 #if !defined(RTPP_DEBUG)
     pvt->ht = rtpp_hash_table_ctor(rtpp_ht_key_str_t, RTPP_HT_NODUPS);
 #else
@@ -97,7 +103,7 @@ rtpp_cmd_rcache_ctor(struct rtpp_timed *rtpp_timed_cf, double min_ttl)
 e2:
     CALL_METHOD(pvt->ht, dtor);
 e0:
-    CALL_SMETHOD(pvt->pub.rcnt, decref);
+    RTPP_OBJ_DECREF(&(pvt->pub));
     free(pvt);
     return (NULL);
 }
@@ -118,10 +124,9 @@ rtpp_cmd_rcache_insert(struct rtpp_cmd_rcache *pub, const char *cookie,
 {
     struct rtpp_cmd_rcache_pvt *pvt;
     struct rtpp_cmd_rcache_entry *rep;
-    struct rtpp_refcnt *rcnt;
 
     pvt = (struct rtpp_cmd_rcache_pvt *)pub;
-    rep = rtpp_rzmalloc(sizeof(struct rtpp_cmd_rcache_entry), &rcnt);
+    rep = rtpp_rzmalloc(sizeof(struct rtpp_cmd_rcache_entry), PVT_RCOFFS(rep));
     if (rep == NULL) {
         return;
     }
@@ -130,17 +135,17 @@ rtpp_cmd_rcache_insert(struct rtpp_cmd_rcache *pub, const char *cookie,
         goto e1;
     }
     rep->etime = ctime + pvt->min_ttl;
-    CALL_SMETHOD(rcnt, attach, rtpp_cmd_rcache_entry_free, rep);
-    CALL_METHOD(pvt->ht, append_refcnt, cookie, rcnt);
+    CALL_SMETHOD(rep->pub.rcnt, attach, rtpp_cmd_rcache_entry_free, rep);
+    CALL_METHOD(pvt->ht, append_refcnt, cookie, rep->pub.rcnt);
     /*
      * append_refcnt() either takes ownership in which case it incs refcount
      * or it drops the ball in which it does not, so we release rco and set
      * it free.
      */
-    CALL_SMETHOD(rcnt, decref);
+    RTPP_OBJ_DECREF(&(rep->pub));
     return;
 e1:
-    CALL_SMETHOD(rcnt, decref);
+    RTPP_OBJ_DECREF(&(rep->pub));
     free(rep);
 }
 
@@ -162,8 +167,8 @@ rtpp_cmd_rcache_lookup(struct rtpp_cmd_rcache *pub, const char *cookie,
      * to decref when we've done with it.
      */
     rep = CALL_SMETHOD(rco, getdata);
-    strncpy(rbuf, rep->reply, rblen);
-    CALL_SMETHOD(rco, decref);
+    strlcpy(rbuf, rep->reply, rblen);
+    RC_DECREF(rco);
     return (1);
 }
 
@@ -175,7 +180,7 @@ rtpp_cmd_rcache_shutdown(struct rtpp_cmd_rcache *pub)
     pvt = (struct rtpp_cmd_rcache_pvt *)pub;
     pvt->timeout_rval = CB_LAST;
     CALL_METHOD(pvt->timeout, cancel);
-    CALL_SMETHOD(pvt->timeout->rcnt, decref);
+    RTPP_OBJ_DECREF(pvt->timeout);
     pvt->timeout = NULL;
 }
 

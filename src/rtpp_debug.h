@@ -33,25 +33,27 @@
 #define RTPP_DBG_YES	1
 #define RTPP_DBG_NO	0
 
+#define RTPP_DEBUG_MAX
+
 #if defined(RTPP_DEBUG)
 # if defined(RTPP_DEBUG_MAX)
 /* Supported levels 0, 1, 2. 1 - basic debug & debug when I/O fails, */
 /*  2 - debug on every packet                                        */
-#  define RTPP_DEBUG_netio      2
+#  define RTPP_DEBUG_netio      1
 /* Supported levels 0, 1. */
-#  define RTPP_DEBUG_timers     1
+#  define RTPP_DEBUG_timers     RTPP_DBG_NO
 /* Catch fatal signals and try to pring backtrace */
 /* Supported levels 0, 1. */
 #  define RTPP_DEBUG_catchtrace 1
 /* Supported levels 0, 1. */
 #  define RTPP_DEBUG_refcnt     1
-/* Supported levels 0, 1. */
+/* Supported levels 0, 1, 2. */
 #  define RTPP_DEBUG_analyze    1
 # else /* !RTPP_DEBUG_MAX */
 #  define RTPP_DEBUG_netio      RTPP_DBG_YES
 #  define RTPP_DEBUG_timers     RTPP_DBG_NO
-#  define RTPP_DEBUG_catchtrace RTPP_DBG_NO
-#  define RTPP_DEBUG_refcnt     RTPP_DBG_NO
+#  define RTPP_DEBUG_catchtrace RTPP_DBG_YES
+#  define RTPP_DEBUG_refcnt     RTPP_DBG_YES
 #  define RTPP_DEBUG_analyze    RTPP_DBG_NO
 # endif /* RTPP_DEBUG_MAX */
 #else /* !RTPP_DEBUG */

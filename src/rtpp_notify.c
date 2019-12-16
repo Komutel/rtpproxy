@@ -52,12 +52,15 @@
 #include "rtpp_tnotify_tgt.h"
 #include "rtpp_mallocs.h"
 #include "rtpp_wi.h"
-#include "rtpp_wi_private.h"
+#include "rtpp_wi_data.h"
+#include "rtpp_wi_sgnl.h"
 
 struct rtpp_notify_wi
 {
     int len;
     struct rtpp_tnotify_target *rttp;
+    struct rtpp_log *glog;
+    const char *ntype;
     char notify_buf[0];
 };
 
@@ -69,12 +72,10 @@ struct rtpp_notify_priv {
     struct rtpp_log *glog;
 };
 
-#define PUB2PVT(pubp)      ((struct rtpp_notify_priv *)((char *)(pubp) - offsetof(struct rtpp_notify_priv, pub)))
-
 static int rtpp_notify_schedule(struct rtpp_notify *,
-  struct rtpp_tnotify_target *, const char *);
+  struct rtpp_tnotify_target *, const char *, const char *);
 static void rtpp_notify_dtor(struct rtpp_notify *);
-static void do_timeout_notification(struct rtpp_notify_wi *, int, struct rtpp_log *);
+static void do_notification(struct rtpp_notify_wi *, int);
 
 static void
 rtpp_notify_queue_run(void *arg)
@@ -87,16 +88,17 @@ rtpp_notify_queue_run(void *arg)
     for (;;) {
         wi = rtpp_queue_get_item(pvt->nqueue, 0);
         if (rtpp_wi_get_type(wi) == RTPP_WI_TYPE_SGNL) {
-            rtpp_wi_free(wi);
+            CALL_METHOD(wi, dtor);
             break;
         }
         wi_data = rtpp_wi_data_get_ptr(wi, sizeof(struct rtpp_notify_wi), 0);
 
         /* main work here */
-        do_timeout_notification(wi_data, 3, wi->log);
+        do_notification(wi_data, 3);
 
         /* deallocate wi */
-        rtpp_wi_free(wi);
+        RTPP_OBJ_DECREF(wi_data->glog);
+        CALL_METHOD(wi, dtor);
     }
 }
 
@@ -109,7 +111,7 @@ rtpp_notify_ctor(struct rtpp_log *glog)
     if (pvt == NULL) {
         goto e0;
     }
-    pvt->nqueue = rtpp_queue_init(1, "rtpp_notify");
+    pvt->nqueue = rtpp_queue_init(RTPQ_SMALL_CB_LEN, "rtpp_notify");
     if (pvt->nqueue == NULL) {
         goto e1;
     }
@@ -124,7 +126,7 @@ rtpp_notify_ctor(struct rtpp_log *glog)
         goto e3;
     }
 
-    CALL_SMETHOD(glog->rcnt, incref);
+    RTPP_OBJ_INCREF(glog);
     pvt->glog = glog;
     pvt->pub.schedule = &rtpp_notify_schedule;
     pvt->pub.dtor = &rtpp_notify_dtor;
@@ -132,7 +134,7 @@ rtpp_notify_ctor(struct rtpp_log *glog)
     return (&pvt->pub);
 
 e3:
-    rtpp_wi_free(pvt->sigterm);
+    CALL_METHOD(pvt->sigterm, dtor);
 e2:
     rtpp_queue_destroy(pvt->nqueue);
 e1:
@@ -146,28 +148,26 @@ rtpp_notify_dtor(struct rtpp_notify *pub)
 {
     struct rtpp_notify_priv *pvt;
 
-    pvt = PUB2PVT(pub);
+    PUB2PVT(pub, pvt);
 
     rtpp_queue_put_item(pvt->sigterm, pvt->nqueue);
     pthread_join(pvt->thread_id, NULL);
-    while (rtpp_queue_get_length(pvt->nqueue) > 0) {
-        rtpp_wi_free(rtpp_queue_get_item(pvt->nqueue, 0));
-    }
     rtpp_queue_destroy(pvt->nqueue);
-    CALL_SMETHOD(pvt->glog->rcnt, decref);
+    RTPP_OBJ_DECREF(pvt->glog);
     free(pvt);
 }
 
 static int
 rtpp_notify_schedule(struct rtpp_notify *pub,
-  struct rtpp_tnotify_target *rttp, const char *notify_tag)
+  struct rtpp_tnotify_target *rttp, const char *notify_tag,
+  const char *notify_type)
 {
     struct rtpp_notify_wi *wi_data;
     struct rtpp_wi *wi;
     int len;
     struct rtpp_notify_priv *pvt;
 
-    pvt = PUB2PVT(pub);
+    PUB2PVT(pub, pvt);
 
     /* string, \0 and \n */
     len = strlen(notify_tag) + 2;
@@ -181,65 +181,65 @@ rtpp_notify_schedule(struct rtpp_notify *pub,
 
     wi_data->rttp = rttp;
     wi_data->len = len;
+    RTPP_OBJ_INCREF(pvt->glog);
+    wi_data->glog = pvt->glog;
+    wi_data->ntype = notify_type;
 
     len = snprintf(wi_data->notify_buf, len, "%s\n", notify_tag);
-
-    CALL_SMETHOD(pvt->glog->rcnt, incref);
-    wi->log = pvt->glog;
 
     rtpp_queue_put_item(wi, pvt->nqueue);
     return (0);
 }
 
 static void
-reconnect_timeout_handler(struct rtpp_log *log, struct rtpp_tnotify_target *rttp)
+reconnect_handler(const struct rtpp_notify_wi *wi)
 {
 
-    assert (rttp->connected == 0);
+    assert (wi->rttp->connected == 0);
 
-    if (rttp->fd == -1) {
-        RTPP_LOG(log, RTPP_LOG_DBUG, "connecting timeout socket");
+    if (wi->rttp->fd == -1) {
+        RTPP_LOG(wi->glog, RTPP_LOG_DBUG, "connecting %s socket", wi->ntype);
     } else {
-        RTPP_LOG(log, RTPP_LOG_DBUG, "reconnecting timeout socket");
-        close(rttp->fd);
+        RTPP_LOG(wi->glog, RTPP_LOG_DBUG, "reconnecting %s socket", wi->ntype);
+        close(wi->rttp->fd);
     }
-    rttp->fd = socket(rttp->socket_type, SOCK_STREAM, 0);
-    if (rttp->fd == -1) {
-        RTPP_ELOG(log, RTPP_LOG_ERR, "can't create timeout socket");
+    wi->rttp->fd = socket(wi->rttp->socket_type, SOCK_STREAM, 0);
+    if (wi->rttp->fd == -1) {
+        RTPP_ELOG(wi->glog, RTPP_LOG_ERR, "can't create %s socket", wi->ntype);
         return;
     }
-    if (rttp->local != NULL) {
-        if (bind(rttp->fd, rttp->local, SA_LEN(rttp->local)) < 0) {
-            RTPP_ELOG(log, RTPP_LOG_ERR, "can't bind timeout socket");
+    if (wi->rttp->local != NULL) {
+        if (bind(wi->rttp->fd, wi->rttp->local, SA_LEN(wi->rttp->local)) < 0) {
+            RTPP_ELOG(wi->glog, RTPP_LOG_ERR, "can't bind %s socket", wi->ntype);
             goto e0;
         }
     }
-    if (connect(rttp->fd, (struct sockaddr *)&(rttp->remote), rttp->remote_len) == -1) {
-        RTPP_ELOG(log, RTPP_LOG_ERR, "can't connect to timeout socket");
+    if (connect(wi->rttp->fd, (struct sockaddr *)&(wi->rttp->remote), wi->rttp->remote_len) == -1) {
+        RTPP_ELOG(wi->glog, RTPP_LOG_ERR, "can't connect to %s socket", wi->ntype);
         goto e0;
     } else {
-        rttp->connected = 1;
+        wi->rttp->connected = 1;
     }
     return;
 
 e0:
-    close(rttp->fd);
-    rttp->fd = -1;
+    close(wi->rttp->fd);
+    wi->rttp->fd = -1;
     return;
 }
 
 static void
-do_timeout_notification(struct rtpp_notify_wi *wi, int retries,
-  struct rtpp_log *log)
+do_notification(struct rtpp_notify_wi *wi, int retries)
 {
     int result;
 
     if (wi->rttp->connected == 0) {
-        reconnect_timeout_handler(log, wi->rttp);
+        reconnect_handler(wi);
 
         /* If connect fails, no notification will be sent */
         if (wi->rttp->connected == 0) {
-            RTPP_LOG(log, RTPP_LOG_ERR, "unable to send timeout notification");
+            RTPP_LOG(wi->glog, RTPP_LOG_ERR, "unable to send %s notification",
+              wi->ntype);
             return;
         }
     }
@@ -250,8 +250,9 @@ do_timeout_notification(struct rtpp_notify_wi *wi, int retries,
 
     if (result < 0) {
         wi->rttp->connected = 0;
-        RTPP_ELOG(log, RTPP_LOG_ERR, "failed to send timeout notification");
+        RTPP_ELOG(wi->glog, RTPP_LOG_ERR, "failed to send %s notification",
+          wi->ntype);
         if (retries > 0)
-            do_timeout_notification(wi, retries - 1, log);
+            do_notification(wi, retries - 1);
     }
 }

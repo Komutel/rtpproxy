@@ -34,10 +34,10 @@
 #include "config.h"
 
 #include "rtpp_log.h"
-#include "rtpp_cfg_stable.h"
-#include "rtpp_defines.h"
+#include "rtpp_cfg.h"
 #include "rtpp_command.h"
 #include "rtpp_command_parse.h"
+#include "rtpp_command_ecodes.h"
 #include "rtpp_command_private.h"
 #include "rtpp_command_query.h"
 #include "rtpp_types.h"
@@ -49,21 +49,23 @@ struct cmd_props {
     int min_argc;
     int has_cmods;
     int has_call_id;
+    int has_subc;
     int fpos;
     int tpos;
     char *cmods;
 };
 
 static int 
-fill_cmd_props(struct cfg *cf, struct rtpp_command *cmd,
+fill_cmd_props(const struct rtpp_cfg *cfsp, struct rtpp_command *cmd,
   struct cmd_props *cpp)
 {
 
     cpp->has_call_id = 1;
+    cpp->has_subc = 0;
     cpp->fpos = -1;
     cpp->tpos = -1;
-    cpp->cmods = &(cmd->argv[0][1]);
-    switch (cmd->argv[0][0]) {
+    cpp->cmods = &(cmd->args.v[0][1]);
+    switch (cmd->args.v[0][0]) {
     case 'u':
     case 'U':
         cmd->cca.op = UPDATE;
@@ -116,7 +118,7 @@ fill_cmd_props(struct cfg *cf, struct rtpp_command *cmd,
     case 'R':
         cmd->cca.op = RECORD;
         cmd->cca.rname = "record";
-        if (cf->stable->record_pcap != 0) {
+        if (cfsp->record_pcap != 0) {
             cmd->cca.hint = "R[s] call_id from_tag [to_tag]";
         } else {
             cmd->cca.hint = "R call_id from_tag [to_tag]";
@@ -216,7 +218,7 @@ fill_cmd_props(struct cfg *cf, struct rtpp_command *cmd,
         cmd->cca.rname = "get_stats";
         cmd->cca.hint = "G[v] [stat_name1 [stat_name2 [stat_name3 ...[stat_nameN]]]]";
         cmd->no_glock = 1;
-        cpp->max_argc = CALL_SMETHOD(cf->stable->rtpp_stats, getnstats) + 1;
+        cpp->max_argc = CALL_SMETHOD(cfsp->rtpp_stats, getnstats) + 1;
         cpp->min_argc = 1;
         cpp->has_cmods = 1;
         cpp->has_call_id = 0;
@@ -229,30 +231,36 @@ fill_cmd_props(struct cfg *cf, struct rtpp_command *cmd,
 }
 
 int
-rtpp_command_pre_parse(struct cfg *cf, struct rtpp_command *cmd)
+rtpp_command_pre_parse(const struct rtpp_cfg *cfsp, struct rtpp_command *cmd)
 {
     struct cmd_props cprops;
 
-    if (fill_cmd_props(cf, cmd, &cprops) != 0) {
-        RTPP_LOG(cf->stable->glog, RTPP_LOG_ERR, "unknown command \"%c\"",
-          cmd->argv[0][0]);
+    if (fill_cmd_props(cfsp, cmd, &cprops) != 0) {
+        RTPP_LOG(cfsp->glog, RTPP_LOG_ERR, "unknown command \"%c\"",
+          cmd->args.v[0][0]);
         reply_error(cmd, ECODE_CMDUNKN);
         return (-1);
     }
-    if (cmd->argc < cprops.min_argc || cmd->argc > cprops.max_argc) {
-        RTPP_LOG(cf->stable->glog, RTPP_LOG_ERR, "%s command syntax error"
-          ": invalid number of arguments (%d)", cmd->cca.rname, cmd->argc);
+    if (cmd->args.c < cprops.min_argc || cmd->args.c > cprops.max_argc) {
+        RTPP_LOG(cfsp->glog, RTPP_LOG_ERR, "%s command syntax error"
+          ": invalid number of arguments (%d)", cmd->cca.rname, cmd->args.c);
         reply_error(cmd, ECODE_PARSE_NARGS);
         return (-1);
     }
     if (cprops.has_cmods == 0 && cprops.cmods[0] != '\0') {
-        RTPP_LOG(cf->stable->glog, RTPP_LOG_ERR, "%s command syntax error"
+        RTPP_LOG(cfsp->glog, RTPP_LOG_ERR, "%s command syntax error"
           ": modifiers are not supported by the command", cmd->cca.rname);
         reply_error(cmd, ECODE_PARSE_MODS);
         return (-1);
     }
-    cmd->cca.call_id = cprops.has_call_id ? cmd->argv[1] : NULL;
-    cmd->cca.from_tag = cprops.fpos > 0 ? cmd->argv[cprops.fpos] : NULL;
-    cmd->cca.to_tag = cprops.tpos > 0 ? cmd->argv[cprops.tpos] : NULL;
+    if (cprops.has_subc == 0 && cmd->subc_args.c > 0) {
+        RTPP_LOG(cfsp->glog, RTPP_LOG_ERR, "%s command syntax error"
+          ": subcommand is not supported", cmd->cca.rname);
+        reply_error(cmd, ECODE_PARSE_SUBC);
+        return (-1);
+    }
+    cmd->cca.call_id = cprops.has_call_id ? cmd->args.v[1] : NULL;
+    cmd->cca.from_tag = cprops.fpos > 0 ? cmd->args.v[cprops.fpos] : NULL;
+    cmd->cca.to_tag = cprops.tpos > 0 ? cmd->args.v[cprops.tpos] : NULL;
     return (0);
 }

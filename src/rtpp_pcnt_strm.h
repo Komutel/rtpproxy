@@ -39,17 +39,6 @@ DEFINE_METHOD(rtpp_pcnt_strm, rtpp_pcnt_strm_get_stats, void,
 DEFINE_METHOD(rtpp_pcnt_strm, rtpp_pcnt_strm_reg_pktin, void,
   struct rtp_packet *);
 
-struct rtpp_pcnts_strm {
-    /* Number of packets received */
-    unsigned long npkts_in;
-    /* TS of the first packet */
-    double first_pkt_rcv;
-    /* TS of the last packet */
-    double last_pkt_rcv;
-    /* Longest inter-packet interval */
-    double longest_ipi;
-};
-
 struct rtpp_pcnt_strm {
     struct rtpp_refcnt *rcnt;
     METHOD_ENTRY(rtpp_pcnt_strm_get_stats, get_stats);

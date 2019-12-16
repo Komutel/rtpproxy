@@ -38,21 +38,23 @@
 #include <string.h>
 #include <unistd.h>
 
-#include "config.h"
+#include "config_pp.h"
 
 #include "rtpp_ssrc.h"
 #include "rtpa_stats.h"
-#include "rtpp_monotime.h"
 #include "rtpp_types.h"
 #include "rtpp_analyzer.h"
 #include "rtpp_pcount.h"
+#include "rtpp_time.h"
 #include "rtpp_pcnt_strm.h"
+#include "rtpp_pcnts_strm.h"
 #include "rtpp_acct_pipe.h"
 #include "rtpp_acct.h"
 #include "rtpp_module.h"
 #include "rtpp_netaddr.h"
 #include "rtpp_network.h"
-#include "rtpp_cfg_stable.h"
+#include "rtpp_util.h"
+#include "rtpp_cfg.h"
 #include "rtpp_log.h"
 #include "rtpp_log_obj.h"
 
@@ -80,7 +82,7 @@ struct rtpp_module_priv {
 
 #define HNAME_REFRESH_IVAL	1.0
 
-static struct rtpp_module_priv *rtpp_acct_csv_ctor(struct rtpp_cfg_stable *);
+static struct rtpp_module_priv *rtpp_acct_csv_ctor(const struct rtpp_cfg *);
 static void rtpp_acct_csv_dtor(struct rtpp_module_priv *);
 static void rtpp_acct_csv_do(struct rtpp_module_priv *, struct rtpp_acct *);
 static off_t rtpp_acct_csv_lockf(int);
@@ -96,31 +98,13 @@ struct rtpp_minfo rtpp_module = {
     .on_session_end = API_FUNC(rtpp_acct_csv_do, rtpp_acct_OSIZE())
 };
 
-#if 0
-/* Quick hack to check and see if periodic updates work as expected */
-static int
-gethostname_test(char *name, size_t namelen)
-{
-    static int i = 0;
-
-    if (i < 2) {
-        strcpy(name, "foo.bar.com");
-        i++;
-        return 0;
-    }
-    return (gethostname(name, namelen));
-}
-
-#define gethostname gethostname_test
-#endif
-
 static const char *
 rtpp_acct_get_nid(struct rtpp_module_priv *pvt, struct rtpp_acct *ap)
 {
 
-    if (pvt->next_hupd_ts == 0.0 || pvt->next_hupd_ts < ap->destroy_ts) {
+    if (pvt->next_hupd_ts == 0.0 || pvt->next_hupd_ts < ap->destroy_ts->mono) {
         if (gethostname(pvt->node_id, sizeof(pvt->node_id)) == 0) {
-            pvt->next_hupd_ts = ap->destroy_ts + HNAME_REFRESH_IVAL;
+            pvt->next_hupd_ts = ap->destroy_ts->mono + HNAME_REFRESH_IVAL;
         }
     }
     return (pvt->node_id);
@@ -238,7 +222,7 @@ e0:
 }
 
 static struct rtpp_module_priv *
-rtpp_acct_csv_ctor(struct rtpp_cfg_stable *cfsp)
+rtpp_acct_csv_ctor(const struct rtpp_cfg *cfsp)
 {
     struct rtpp_module_priv *pvt;
 
@@ -278,7 +262,7 @@ rtpp_acct_csv_dtor(struct rtpp_module_priv *pvt)
 }
 
 #define ES_IF_NULL(s) ((s) == NULL ? "" : s)
-#define MT2RT_NZ(mt) ((mt) == 0.0 ? 0.0 : dtime2rtime(mt))
+#define TS2RT(ts) ((ts).wall)
 
 static void
 format_ssrc(struct rtpp_ssrc *sp, char *sbuf, size_t sblen)
@@ -345,9 +329,9 @@ rtpp_acct_csv_do(struct rtpp_module_priv *pvt, struct rtpp_acct *acct)
       HLD_STS_FMT SEP HLD_STS_FMT SEP HLD_CNT_FMT SEP HLD_CNT_FMT "\n",
       RTPP_METRICS_VERSION, rtpp_acct_get_nid(pvt, acct),
       pvt->pid, acct->seuid, ES_IF_NULL(acct->call_id), ES_IF_NULL(acct->from_tag),
-      MT2RT_NZ(acct->init_ts), MT2RT_NZ(acct->destroy_ts), MT2RT_NZ(acct->rtp.o.ps->first_pkt_rcv),
-      MT2RT_NZ(acct->rtp.o.ps->last_pkt_rcv), MT2RT_NZ(acct->rtp.a.ps->first_pkt_rcv),
-      MT2RT_NZ(acct->rtp.a.ps->last_pkt_rcv), acct->rtp.a.ps->npkts_in, acct->rtp.o.ps->npkts_in,
+      TS2RT(*acct->init_ts), TS2RT(*acct->destroy_ts), TS2RT(acct->rtp.o.ps->first_pkt_rcv),
+      TS2RT(acct->rtp.o.ps->last_pkt_rcv), TS2RT(acct->rtp.a.ps->first_pkt_rcv),
+      TS2RT(acct->rtp.a.ps->last_pkt_rcv), acct->rtp.a.ps->npkts_in, acct->rtp.o.ps->npkts_in,
       acct->rtp.pcnts->nrelayed, acct->rtp.pcnts->ndropped, acct->rtcp.a.ps->npkts_in,
       acct->rtcp.o.ps->npkts_in, acct->rtcp.pcnts->nrelayed, acct->rtcp.pcnts->ndropped,
       acct->rasto->psent, acct->rasto->precvd, acct->rasto->pdups, acct->rasto->plost,

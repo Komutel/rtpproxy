@@ -35,9 +35,10 @@
 #include "rtpp_types.h"
 #include "rtpp_weakref.h"
 #include "rtp.h"
+#include "rtpp_time.h"
 #include "rtp_packet.h"
 #include "rtp_resizer.h"
-#include "rtpp_cfg_stable.h"
+#include "rtpp_cfg.h"
 #include "rtpp_defines.h"
 #include "rtpp_proc.h"
 #include "rtpp_record.h"
@@ -45,28 +46,28 @@
 #include "rtpp_sessinfo.h"
 #include "rtpp_stream.h"
 #include "rtpp_pcount.h"
+#include "rtpp_socket.h"
 #include "rtpp_session.h"
 #include "rtpp_ttl.h"
 #include "rtpp_pipe.h"
-#include "rtpp_acct_rtcp.h"
-#include "rtpp_list.h"
-#include "rtpp_module_if.h"
+#include "advanced/po_manager.h"
 
 struct rtpp_proc_ready_lst {
     struct rtpp_session *sp;
     struct rtpp_stream *stp;
 };
 
-static void send_packet(struct cfg *, struct rtpp_stream *,
+static void send_packet(const struct rtpp_cfg *, struct rtpp_stream *,
   struct rtp_packet *, struct sthread_args *, struct rtpp_proc_rstats *);
 
 static void
-rxmit_packets(struct cfg *cf, struct rtpp_stream *stp,
-  double dtime, int drain_repeat, struct sthread_args *sender,
-  struct rtpp_proc_rstats *rsp, const char *call_id)
+rxmit_packets(const struct rtpp_cfg *cfsp, struct rtpp_stream *stp,
+  const struct rtpp_timestamp *dtime, int drain_repeat, struct sthread_args *sender,
+  struct rtpp_proc_rstats *rsp, const struct rtpp_session *sp)
 {
     int ndrain;
     struct rtp_packet *packet = NULL;
+    struct po_mgr_pkt_ctx pktx;
 
     /* Repeat since we may have several packets queued on the same socket */
     ndrain = -1;
@@ -77,7 +78,7 @@ rxmit_packets(struct cfg *cf, struct rtpp_stream *stp,
             ndrain -= 1;
         }
 
-	packet = CALL_SMETHOD(stp, rx, cf->stable->rtcp_streams_wrt, dtime,
+	packet = CALL_SMETHOD(stp, rx, cfsp->rtcp_streams_wrt, dtime,
           rsp);
 	if (packet == NULL) {
             /* Move on to the next session */
@@ -87,35 +88,28 @@ rxmit_packets(struct cfg *cf, struct rtpp_stream *stp,
             ndrain += 1;
             continue;
         }
-        send_packet(cf, stp, packet, sender, rsp);
-        if (stp->pipe_type == PIPE_RTCP && !RTPP_LIST_IS_EMPTY(cf->stable->modules_cf)) {
-            struct rtpp_acct_rtcp *rarp;
-            struct rtpp_module_if *mif;
-
-            rarp = rtpp_acct_rtcp_ctor(call_id, packet);
-            if (rarp == NULL) {
-                continue;
-            }
-            mif = RTPP_LIST_HEAD(cf->stable->modules_cf);
-            CALL_METHOD(mif, do_acct_rtcp, rarp);
-        }
+        pktx.sessp = sp;
+        pktx.strmp = stp;
+        pktx.pktp = packet;
+        CALL_METHOD(cfsp->observers, observe, &pktx);
+        send_packet(cfsp, stp, packet, sender, rsp);
     } while (ndrain > 0);
     return;
 }
 
 static struct rtpp_stream *
-get_sender(struct cfg *cf, struct rtpp_stream *stp)
+get_sender(const struct rtpp_cfg *cfsp, struct rtpp_stream *stp)
 {
     if (stp->pipe_type == PIPE_RTP) {
-       return (CALL_METHOD(cf->stable->rtp_streams_wrt, get_by_idx,
+       return (CALL_METHOD(cfsp->rtp_streams_wrt, get_by_idx,
          stp->stuid_sendr));
     }
-    return (CALL_METHOD(cf->stable->rtcp_streams_wrt, get_by_idx,
+    return (CALL_METHOD(cfsp->rtcp_streams_wrt, get_by_idx,
       stp->stuid_sendr));
 }
 
 static void
-send_packet(struct cfg *cf, struct rtpp_stream *stp_in,
+send_packet(const struct rtpp_cfg *cfsp, struct rtpp_stream *stp_in,
   struct rtp_packet *packet, struct sthread_args *sender,
   struct rtpp_proc_rstats *rsp)
 {
@@ -123,7 +117,7 @@ send_packet(struct cfg *cf, struct rtpp_stream *stp_in,
 
     CALL_METHOD(stp_in->ttl, reset);
 
-    stp_out = get_sender(cf, stp_in);
+    stp_out = get_sender(cfsp, stp_in);
     if (stp_out == NULL) {
         goto e0;
     }
@@ -145,25 +139,27 @@ send_packet(struct cfg *cf, struct rtpp_stream *stp_in,
         CALL_METHOD(stp_in->pcount, reg_reld);
         rsp->npkts_relayed.cnt++;
     }
-    CALL_SMETHOD(stp_out->rcnt, decref);
+    RTPP_OBJ_DECREF(stp_out);
     return;
 
 e1:
-    CALL_SMETHOD(stp_out->rcnt, decref);
+    RTPP_OBJ_DECREF(stp_out);
 e0:
-    rtp_packet_free(packet);
+    RTPP_OBJ_DECREF(packet);
     CALL_METHOD(stp_in->pcount, reg_drop);
     rsp->npkts_discard.cnt++;
 }
 
 void
-process_rtp_only(struct cfg *cf, struct rtpp_polltbl *ptbl, double dtime,
-  int drain_repeat, struct sthread_args *sender, struct rtpp_proc_rstats *rsp)
+process_rtp_only(const struct rtpp_cfg *cfsp, struct rtpp_polltbl *ptbl,
+  const struct rtpp_timestamp *dtime, int drain_repeat, struct sthread_args *sender,
+  struct rtpp_proc_rstats *rsp)
 {
     int readyfd, ndrained;
     struct rtpp_session *sp;
     struct rtpp_stream *stp;
     struct rtp_packet *packet;
+    struct rtpp_socket *iskt;
 
     for (readyfd = 0; readyfd < ptbl->curlen; readyfd++) {
         if ((ptbl->pfds[readyfd].revents & POLLIN) == 0)
@@ -172,28 +168,32 @@ process_rtp_only(struct cfg *cf, struct rtpp_polltbl *ptbl, double dtime,
           ptbl->mds[readyfd].stuid);
         if (stp == NULL)
             continue;
-        sp = CALL_METHOD(cf->stable->sessions_wrt, get_by_idx, stp->seuid);
+        sp = CALL_METHOD(cfsp->sessions_wrt, get_by_idx, stp->seuid);
         if (sp == NULL) {
-            CALL_SMETHOD(stp->rcnt, decref);
+            RTPP_OBJ_DECREF(stp);
             continue;
         }
+        iskt = ptbl->mds[readyfd].skt;
         if (sp->complete != 0) {
-            rxmit_packets(cf, stp, dtime, drain_repeat, sender, rsp, sp->call_id);
-            CALL_SMETHOD(sp->rcnt, decref);
+            rxmit_packets(cfsp, stp, dtime, drain_repeat, sender, rsp, sp);
+            RTPP_OBJ_DECREF(sp);
             if (stp->resizer != NULL) {
-                while ((packet = rtp_resizer_get(stp->resizer, dtime)) != NULL) {
-                    send_packet(cf, stp, packet, sender, rsp);
+                while ((packet = rtp_resizer_get(stp->resizer, dtime->mono)) != NULL) {
+                    send_packet(cfsp, stp, packet, sender, rsp);
                     rsp->npkts_resizer_out.cnt++;
                     packet = NULL;
                 }
             }
         } else {
-            CALL_SMETHOD(sp->rcnt, decref);
-            ndrained = CALL_SMETHOD(stp, drain_skt);
+            const char *proto;
+
+            RTPP_OBJ_DECREF(sp);
+            proto = CALL_SMETHOD(stp, get_proto);
+            ndrained = CALL_METHOD(iskt, drain, proto, stp->log);
             if (ndrained > 0) {
                 rsp->npkts_discard.cnt += ndrained;
             }
         }
-        CALL_SMETHOD(stp->rcnt, decref);
+        RTPP_OBJ_DECREF(stp);
     }
 }

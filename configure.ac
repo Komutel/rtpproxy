@@ -31,7 +31,7 @@ freebsd*)
   #LIBS=
   ;;
 linux*)
-  CPPFLAGS="-D_BSD_SOURCE -D_ISOC99_SOURCE -DLINUX_XXX"
+  CPPFLAGS="-D_DEFAULT_SOURCE -D_ISOC99_SOURCE -DLINUX_XXX"
   LIBS="-lrt"
   ;;
 solaris*)
@@ -41,10 +41,25 @@ solaris*)
   ;;
 esac
 
+AX_COMPILE_CHECK_SIZEOF(time_t, [#include <time.h>])
+
 AC_ARG_ENABLE(systemd,
 AS_HELP_STRING([--enable-systemd], [enable systemd support in rtpproxy]),
 [],
 [enable_systemd=no])
+
+AC_ARG_ENABLE(coverage,
+  AC_HELP_STRING([--enable-coverage], [enable test coverage support]),
+  AC_DEFINE([ENABLE_COVERAGE], [], [Test coverage support is enabled])
+  CFLAGS="${CFLAGS} --coverage"; LDFLAGS="${LDFLAGS} --coverage"; break], [])
+
+AC_ARG_ENABLE(memglitching,
+  AC_HELP_STRING([--enable-memglitching], [enable advanced tests around malloc glitching]),
+  [ENABLE_MEMGLITCHING=${enableval}], [ENABLE_MEMGLITCHING=no])
+
+AC_ARG_ENABLE(basic-tests,
+  AC_HELP_STRING([--enable-basic-tests], [enable basic functionality tests]),
+  [ENABLE_BASIC_TESTS=${enableval}], [ENABLE_BASIC_TESTS=yes])
 
 # Checks for libraries.
 
@@ -133,22 +148,22 @@ then
    AC_DEFINE([ENABLE_SNDFILE], 1, [Define if you have libsndfile library installed]))
 fi
 
-# libsrtp
-AC_CHECK_HEADER(srtp/srtp.h, found_libsrtp=yes)
-if test "$found_libsrtp" = yes
-then
-  AC_CHECK_LIB(srtp, srtp_init,
-   LIBS_SRTP="-lsrtp"
-   AC_DEFINE([ENABLE_SRTP], 1, [Define if you have libsrtp library installed]))
-fi
-
-# libsrtp2
+# libsrtp2 (preferred)
 AC_CHECK_HEADER(srtp2/srtp.h, found_libsrtp2=yes)
 if test "$found_libsrtp2" = yes
 then
   AC_CHECK_LIB(srtp2, srtp_init,
    LIBS_SRTP="-lsrtp2"
    AC_DEFINE([ENABLE_SRTP2], 1, [Define if you have libsrtp2 library installed]))
+else
+  # libsrtp
+  AC_CHECK_HEADER(srtp/srtp.h, found_libsrtp=yes)
+  if test "$found_libsrtp" = yes
+  then
+    AC_CHECK_LIB(srtp, srtp_init,
+     LIBS_SRTP="-lsrtp"
+     AC_DEFINE([ENABLE_SRTP], 1, [Define if you have libsrtp library installed]))
+  fi
 fi
 
 # libelperiodic
@@ -181,6 +196,7 @@ fi
 AC_CHECK_HEADER(stdatomic.h, found_stdatomic=yes)
 if test "$found_stdatomic" = yes
 then
+  ENABLE_OBJCK=1
   AC_DEFINE([ENABLE_OBJCK], 1, [Define if you want to build rtpp_objck test app])
 fi
 
@@ -188,7 +204,7 @@ fi
 AC_HEADER_STDC
 AC_CHECK_HEADERS([arpa/inet.h fcntl.h limits.h netdb.h netinet/in.h stdlib.h])
 AC_CHECK_HEADERS([string.h strings.h sys/socket.h sys/time.h unistd.h err.h endian.h sys/endian.h])
-AC_CHECK_HEADERS([libgen.h stdio.h float.h math.h sys/mman.h ctype.h errno.h])
+AC_CHECK_HEADERS([libgen.h stdio.h float.h math.h sys/mman.h ctype.h errno.h sys/sysctl.h])
 
 # Checks for typedefs, structures, and compiler characteristics.
 AC_C_CONST
@@ -256,18 +272,49 @@ then
   AC_DEFINE([ENABLE_UDP_CONTENTION], 1, [Define to build udp_contention utility])
 fi
 
-AC_MSG_CHECKING([for __sync_fetch_and_add])
+AC_MSG_CHECKING([whether -latomic is needed for __atomic builtins])
 AC_LINK_IFELSE(
-   [AC_LANG_SOURCE([
-    int main(void) {
-        volatile int rcval = 1, rcval_pre;
-        rcval_pre = __sync_fetch_and_add(&rcval, -1);
-        return(rcval == 0 && rcval_pre == 1 ? 0 : 1);
-    }
-   ])],
-     [AC_MSG_RESULT([yes])
-     AC_DEFINE([HAVE_GCC_ATOMICS],[1],[Define if you have gcc-style atomic operations])],
-   [AC_MSG_RESULT([no])]
+  [AC_LANG_PROGRAM([[#include <stdint.h>]],
+    [[uint64_t val = 0; __atomic_add_fetch(&val, 1, __ATOMIC_RELAXED);]]
+  )],
+  [AC_MSG_RESULT([no])],
+  [LIBS="$LIBS -latomic"
+    AC_LINK_IFELSE(
+      [AC_LANG_PROGRAM([[#include <stdint.h>]],
+                       [[uint64_t val = 0; __atomic_add_fetch(&val, 1, __ATOMIC_RELAXED);]]
+      )],
+      [AC_MSG_RESULT([yes])],
+      [AC_MSG_FAILURE([libatomic needed, but linking with -latomic failed, cannot continue])]
+  )]
+)
+AC_CHECK_FUNCS([pthread_yield])
+
+# <DocBook & friends>
+AX_CHECK_DOCBOOK_DTD(4.5)
+if test "x$HAVE_DOCBOOK_DTD_4_5" = "xyes"
+then
+  AC_CHECK_PROG(HAVE_FOP, fop, yes)
+fi
+# </DocBook & friends>
+
+AC_MSG_CHECKING([for SO_TS_CLOCK/SO_TS_MONOTONIC])
+AC_COMPILE_IFELSE( [AC_LANG_PROGRAM([[
+  #include <sys/types.h>
+  #include <sys/socket.h>
+  ]],
+  [[
+  int stype = SO_TS_MONOTONIC;
+  struct cmsghdr mymsg = {.cmsg_type = SCM_MONOTONIC};
+  setsockopt(0, 0, SO_TS_CLOCK, &stype, sizeof(stype));
+  ]])],
+[
+  AC_MSG_RESULT([yes])
+  AC_DEFINE_UNQUOTED([HAVE_SO_TS_CLOCK], 1, [Define to 1 if you have the SO_TS_CLOCK.])
+],
+[
+  AC_MSG_RESULT([no])
+  AC_DEFINE_UNQUOTED([HAVE_SO_TS_CLOCK], 0, [Define to 1 if you have the SO_TS_CLOCK.])
+]
 )
 
 AM_CONDITIONAL(BUILD_EXTRACTAUDIO, [test "${LIBS_SNDFILE}" != ""])
@@ -278,11 +325,15 @@ AM_CONDITIONAL(BUILD_CRYPTO, [test "${LIBS_SRTP}" != ""])
 AM_CONDITIONAL(BUILD_LOG_STAND, [test "${LIBS_SIPLOG}" = ""])
 AM_CONDITIONAL(BUILD_UDP_CONTENTION, [test "${ENABLE_UDP_CONTENTION}" = 1])
 AM_CONDITIONAL(BUILD_OBJCK, [test "${ENABLE_OBJCK}" = 1])
+AM_CONDITIONAL(BUILD_DOCS, [test "x${HAVE_DOCBOOK_DTD_4_5}" = "xyes" ])
+AM_CONDITIONAL(ENABLE_MEMGLITCHING, [test "x${ENABLE_MEMGLITCHING}" = "xyes" ])
+AM_CONDITIONAL(ENABLE_BASIC_TESTS, [test "x${ENABLE_BASIC_TESTS}" = "xyes" ])
 
 AC_CONFIG_FILES([Makefile src/Makefile makeann/Makefile tests/Makefile
  extractaudio/Makefile libexecinfo/Makefile modules/Makefile
  modules/acct_csv/Makefile modules/acct_rtcp_hep/Makefile
- pertools/Makefile pertools/udp_contention/Makefile libucl/Makefile])
+ pertools/Makefile pertools/udp_contention/Makefile libucl/Makefile
+ python/sippy_lite/sippy/Time/clock_dtime.py doc/Makefile])
 
 AM_COND_IF([BUILD_ELPERIODIC], [AC_CONFIG_SUBDIRS([libelperiodic])])
 
@@ -292,9 +343,9 @@ AC_SUBST(LIBS_GSM)
 AC_SUBST(LIBS_G729)
 AC_SUBST(LIBS_G722)
 AC_SUBST(LIBS_SNDFILE)
-AC_SUBST(LIBS_DL)
 AC_SUBST(LIBS_SRTP)
 AC_SUBST(LIBS_SIPLOG)
 AC_SUBST(LIBS_SIPLOG_DBG)
 AC_SUBST(LIBS_ELPERIODIC)
+AC_SUBST(SIZEOF_TIME_T)
 AC_OUTPUT

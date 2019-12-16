@@ -27,6 +27,7 @@
 
 #include <assert.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -103,12 +104,22 @@ rtpp_sbuf_extend(struct rtpp_sbuf *sbp, int nlen)
      return (0);
 }
 
-void
+#if defined(rtpp_sbuf_selftest)
+#include <stdint.h>
+#include "rtpp_memdeb_internal.h"
+#include "libexecinfo/stacktraverse.h"
+#include "libexecinfo/execinfo.h"
+
+RTPP_MEMDEB_APP_STATIC;
+
+int
 rtpp_sbuf_selftest(void)
 {
     struct rtpp_sbuf *sbp;
     int rval;
     const char *longtest = "INFO:GLOBAL:rtpp_proc_async_run: ncycles=2600 load=0.068641";
+
+    RTPP_MEMDEB_APP_INIT();
 
     sbp = rtpp_sbuf_ctor(6);
     assert(sbp != NULL);
@@ -148,7 +159,11 @@ rtpp_sbuf_selftest(void)
     assert(sbp->cp[0] == '\0');
     assert(sbp->alen == rval + 1);
     rtpp_sbuf_dtor(sbp);
+
+    rval = rtpp_memdeb_dumpstats(MEMDEB_SYM, 0);
+    return (rval);
 }
+#endif /* rtpp_sbuf_selftest */
 
 void
 rtpp_sbuf_reset(struct rtpp_sbuf *sbp)

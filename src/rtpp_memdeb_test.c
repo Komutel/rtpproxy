@@ -26,6 +26,7 @@
  */
 
 #include <sys/stat.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -49,6 +50,9 @@ rtpp_memdeb_selftest(void *pvt)
     memset(&mds_b, '\0', sizeof(mds_b));
     memset(&mds_a, '\0', sizeof(mds_a));
     p = malloc(50);
+    if (p == NULL) {
+        return (-1);
+    }
     free(p);
     if (rtpp_memdeb_get_stats(pvt, __FILE__, __func__, &mds_b) < 1) {
         RTPP_MEMDEB_REPORT(NULL, "MEMDEB is compiled in but is not working");
@@ -61,6 +65,9 @@ rtpp_memdeb_selftest(void *pvt)
     }
     for (i = 0; i < 10; i++) {
         p = malloc(16);
+        if (p == NULL) {
+            return (-1);
+        }
         free(p);
     }
     if (rtpp_memdeb_get_stats(pvt, __FILE__, __func__, &mds_a) < 2) {

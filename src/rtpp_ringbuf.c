@@ -51,20 +51,16 @@ static void rtpp_ringbuf_push(struct rtpp_ringbuf *, void *);
 static void rtpp_ringbuf_flush(struct rtpp_ringbuf *);
 static int rtpp_ringbuf_locate(struct rtpp_ringbuf *, void *);
 
-#define PUB2PVT(pubp)      ((struct rtpp_ringbuf_priv *)((char *)(pubp) - \
-  offsetof(struct rtpp_ringbuf_priv, pub)))
 
 struct rtpp_ringbuf *
 rtpp_ringbuf_ctor(size_t el_size, int nelements)
 {
     struct rtpp_ringbuf_priv *pvt;
-    struct rtpp_refcnt *rcnt;
 
-    pvt = rtpp_rzmalloc(sizeof(struct rtpp_ringbuf_priv), &rcnt);
+    pvt = rtpp_rzmalloc(sizeof(struct rtpp_ringbuf_priv), PVT_RCOFFS(pvt));
     if (pvt == NULL) {
         goto e0;
     }
-    pvt->pub.rcnt = rcnt;
     pvt->elements = rtpp_zmalloc(el_size * nelements);
     if (pvt->elements == NULL) {
         goto e1;
@@ -78,7 +74,7 @@ rtpp_ringbuf_ctor(size_t el_size, int nelements)
       pvt);
     return (&pvt->pub);
 e1:
-    CALL_SMETHOD(pvt->pub.rcnt, decref);
+    RTPP_OBJ_DECREF(&(pvt->pub));
     free(pvt);
 e0:
     return (NULL);
@@ -99,7 +95,7 @@ rtpp_ringbuf_push(struct rtpp_ringbuf *self, void *data)
     struct rtpp_ringbuf_priv *pvt;
     void *dp;
 
-    pvt = PUB2PVT(self);
+    PUB2PVT(self, pvt);
     dp = (char *)pvt->elements + (pvt->el_size * pvt->c_elem);
     memcpy(dp, data, pvt->el_size);
     pvt->c_elem++;
@@ -116,7 +112,7 @@ rtpp_ringbuf_flush(struct rtpp_ringbuf *self)
 {
     struct rtpp_ringbuf_priv *pvt;
 
-    pvt = PUB2PVT(self);
+    PUB2PVT(self, pvt);
     pvt->b_full = 0;
     pvt->c_elem = 0;
 }
@@ -128,7 +124,7 @@ rtpp_ringbuf_locate(struct rtpp_ringbuf *self, void *data)
     int i, last_el;
     void *dp;
 
-    pvt = PUB2PVT(self);
+    PUB2PVT(self, pvt);
     last_el = (pvt->b_full != 0) ? pvt->nelements : pvt->c_elem;
     for (i = 0; i < last_el; i++) {
         dp = (char *)pvt->elements + (pvt->el_size * i);

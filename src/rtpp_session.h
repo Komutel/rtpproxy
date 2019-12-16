@@ -33,11 +33,8 @@ struct rtpp_session;
 struct rtpp_socket;
 struct common_cmd_args;
 struct sockaddr;
-
-struct rtpp_timeout_data {
-    char *notify_tag;
-    struct rtpp_tnotify_target *notify_target;
-};
+struct rtpp_timestamp;
+struct rtpp_timeout_data;
 
 struct rtpp_session {
     char *call_id;
@@ -50,7 +47,7 @@ struct rtpp_session {
     int complete;
     /* Flags: strong create/delete; weak ones */
     int strong;
-    struct rtpp_timeout_data timeout_data;
+    struct rtpp_timeout_data *timeout_data;
     /* UID */
     uint64_t seuid;
 
@@ -61,15 +58,14 @@ struct rtpp_session {
     struct rtpp_refcnt *rcnt;
 };
 
-struct cfg;
-struct cfg_stable;
+struct rtpp_cfg;
 
 int compare_session_tags(const char *, const char *, unsigned *);
-int find_stream(struct cfg *, const char *, const char *, const char *,
-  struct rtpp_session **);
+int find_stream(const struct rtpp_cfg *, const char *, const char *,
+  const char *, struct rtpp_session **);
 
-struct rtpp_session *rtpp_session_ctor(struct rtpp_cfg_stable *,
-  struct common_cmd_args *, double, struct sockaddr **, int, int,
-  struct rtpp_socket **);
+struct rtpp_session *rtpp_session_ctor(const struct rtpp_cfg *,
+  struct common_cmd_args *, const struct rtpp_timestamp *,
+  const struct sockaddr **, int, int, struct rtpp_socket **);
 
 #endif

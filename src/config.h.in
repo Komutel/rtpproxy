@@ -11,6 +11,9 @@
 /* Define if you have bcg729 library */
 #undef ENABLE_BCG729
 
+/* Test coverage support is enabled */
+#undef ENABLE_COVERAGE
+
 /* Define if you have libg722 library installed */
 #undef ENABLE_G722
 
@@ -22,6 +25,9 @@
 
 /* Define to enable dymanic modules */
 #undef ENABLE_MODULE_IF
+
+/* Define if you want to build rtpp_objck test app */
+#undef ENABLE_OBJCK
 
 /* Define if you have libsiplog library installed */
 #undef ENABLE_SIPLOG
@@ -72,9 +78,6 @@
 /* Define to 1 if you have the <float.h> header file. */
 #undef HAVE_FLOAT_H
 
-/* Define if you have gcc-style atomic operations */
-#undef HAVE_GCC_ATOMICS
-
 /* Define to 1 if you have the `gettimeofday' function. */
 #undef HAVE_GETTIMEOFDAY
 
@@ -112,11 +115,17 @@
 /* define to 1 if bcg729 new API have to be used */
 #undef HAVE_NEW_BCG729_API
 
+/* Define to 1 if you have the `pthread_yield' function. */
+#undef HAVE_PTHREAD_YIELD
+
 /* Have the sockaddr_un.sun_len member. */
 #undef HAVE_SOCKADDR_SUN_LEN
 
 /* Define to 1 if you have the `socket' function. */
 #undef HAVE_SOCKET
+
+/* Define to 1 if you have the SO_TS_CLOCK. */
+#undef HAVE_SO_TS_CLOCK
 
 /* Define to 1 if you have the <stdint.h> header file. */
 #undef HAVE_STDINT_H
@@ -160,6 +169,9 @@
 /* Define to 1 if you have the <sys/stat.h> header file. */
 #undef HAVE_SYS_STAT_H
 
+/* Define to 1 if you have the <sys/sysctl.h> header file. */
+#undef HAVE_SYS_SYSCTL_H
+
 /* Define to 1 if you have the <sys/time.h> header file. */
 #undef HAVE_SYS_TIME_H
 
@@ -195,6 +207,9 @@
 
 /* Define as the return type of signal handlers (`int' or `void'). */
 #undef RETSIGTYPE
+
+/* The number of bytes in type time_t */
+#undef SIZEOF_TIME_T
 
 /* If using the C implementation of alloca, define if you know the
    direction of stack growth for your system; otherwise it will be

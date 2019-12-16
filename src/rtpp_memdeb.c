@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014 Sippy Software, Inc., http://www.sippysoft.com
+ * Copyright (c) 2014-2019 Sippy Software, Inc., http://www.sippysoft.com
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -34,17 +34,23 @@
  */
 
 #include <sys/types.h>
+#include <errno.h>
 #include <pthread.h>
 #include <inttypes.h>
+#include <assert.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stddef.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "config.h"
 
+#include "rtpp_defines.h"
 #include "rtpp_log.h"
 #include "rtpp_types.h"
 #include "rtpp_refcnt.h"
@@ -52,6 +58,10 @@
 #include "rtpp_memdeb.h"
 #include "rtpp_memdeb_internal.h"
 #include "rtpp_memdeb_stats.h"
+#include "rtpp_codeptr.h"
+#include "rtpp_glitch.h"
+#include "libexecinfo/stacktraverse.h"
+#include "libexecinfo/execinfo.h"
 
 #undef malloc
 #undef free
@@ -68,25 +78,19 @@
 
 #define MEMDEB_SIGNATURE 0x8b26e00041dfdec6UL
 
-#define MEMDEB_SIGNATURE_ALLOC(x) (MEMDEB_SIGNATURE ^ (uint64_t)(x))
+#define MEMDEB_SIGNATURE_ALLOC(x) (uint64_t)(MEMDEB_SIGNATURE ^ (uintptr_t)(x))
 #define MEMDEB_SIGNATURE_FREE(x) (~MEMDEB_SIGNATURE_ALLOC(x))
 
 #define MEMDEB_SIG_PRIV_SALT 0x7d442e4532bb9ef0UL
 #define MEMDEB_SIGNATURE_PRIV(x) \
-  (MEMDEB_SIG_PRIV_SALT ^ (uint64_t)(x))
+  (uint64_t)(MEMDEB_SIG_PRIV_SALT ^ (uintptr_t)(x))
 
 #define MEMDEB_GUARD_SIZE 8
-
-struct memdeb_loc {
-    const char *fname;
-    int linen;
-    const char *funcn;
-};
 
 struct memdeb_node
 {
     uint64_t magic;
-    struct memdeb_loc loc;
+    struct rtpp_codeptr loc;
     struct memdeb_stats mstats;
     struct memdeb_node *next;
 };
@@ -117,23 +121,30 @@ struct rtpp_memdeb_priv {
     const char *inst_name;
 };
 
-#define STRINGIFY(x) #x
-#define TOSTRING(x) STRINGIFY(x)
-
 void *
-rtpp_memdeb_init()
+rtpp_memdeb_init(bool is_main)
 {
     struct rtpp_memdeb_priv *pvt;
 
     pvt = malloc(sizeof(struct rtpp_memdeb_priv));
     if (pvt == NULL) {
-        return (NULL);
+        goto e0;
     }
     memset(pvt, '\0', sizeof(struct rtpp_memdeb_priv));
-    pthread_mutex_init(&pvt->mutex, NULL);
+    if (pthread_mutex_init(&pvt->mutex, NULL) != 0)
+        goto e1;
     pvt->magic = MEMDEB_SIGNATURE_PRIV(pvt);
-    pvt->inst_name = TOSTRING(MEMDEB_APP);
+    pvt->inst_name = STR(MEMDEB_APP);
+
+    if (is_main) {
+        rtpp_glitch_init();
+   }
+
     return (pvt);
+e1:
+    free(pvt);
+e0:
+    return (NULL);
 }
 
 #define CHK_PRIV(pvt, p) { \
@@ -152,7 +163,7 @@ rtpp_memdeb_dtor(void *p)
 
     CHK_PRIV(pvt, p);
     if (pvt->_md_glog != NULL) {
-        CALL_SMETHOD(pvt->_md_glog->rcnt, decref);
+        RTPP_OBJ_DECREF(pvt->_md_glog);
     }
     pvt->magic = MEMDEB_SIGNATURE_FREE(pvt);
     pthread_mutex_destroy(&pvt->mutex);
@@ -166,7 +177,7 @@ rtpp_memdeb_setlog(void *p, struct rtpp_log *log)
     struct rtpp_memdeb_priv *pvt;
 
     CHK_PRIV(pvt, p);
-    CALL_SMETHOD(log->rcnt, incref);
+    RTPP_OBJ_INCREF(log);
     pvt->_md_glog = log;
 }
 
@@ -204,7 +215,7 @@ rtpp_memdeb_approve(void *p, const char *funcn, int max_nunalloc,
     }
 
 static struct memdeb_node *
-rtpp_memdeb_nget(struct rtpp_memdeb_priv *pvt, struct memdeb_loc *mlp,
+rtpp_memdeb_nget(struct rtpp_memdeb_priv *pvt, const struct rtpp_codeptr *mlp,
   int doalloc)
 {
     struct memdeb_node *rval, *mnp, *lastnode;
@@ -251,23 +262,40 @@ rtpp_memdeb_nget(struct rtpp_memdeb_priv *pvt, struct memdeb_loc *mlp,
         } \
     }
 
+static void *rtpp_memdeb_imalloc(size_t, void *, int,
+  const struct rtpp_codeptr *);
+static int rtpp_memdeb_ivasprintf(char **, const char *, void *,
+  const struct rtpp_codeptr *, va_list ap);
+
 void *
-rtpp_memdeb_malloc(size_t size, void *p, const char *fname, int linen, const char *funcn)
+rtpp_memdeb_malloc(size_t size, void *p, const char *fname,
+  int linen, const char *funcn)
+{
+    struct rtpp_codeptr ml;
+
+    ml.fname = fname;
+    ml.linen = linen;
+    ml.funcn = funcn;
+    return (rtpp_memdeb_imalloc(size, p, 0, &ml));
+}
+
+static void *
+rtpp_memdeb_imalloc(size_t size, void *p, int noglitch,
+  const struct rtpp_codeptr *mlp)
 {
     struct memdeb_node *mnp;
     struct memdeb_pfx *mpf;
     unsigned char *gp;
     uint64_t guard;
     struct rtpp_memdeb_priv *pvt;
-    struct memdeb_loc ml;
 
-    ml.fname = fname;
-    ml.linen = linen;
-    ml.funcn = funcn;
+    if (!noglitch) {
+        GLITCH_INJECT(mlp, glitched);
+    }
 
-    CHK_PRIV_VRB(pvt, p, &ml);
+    CHK_PRIV_VRB(pvt, p, mlp);
     mpf = malloc(offsetof(struct memdeb_pfx, real_data) + size + MEMDEB_GUARD_SIZE);
-    mnp = rtpp_memdeb_nget(pvt, &ml, 1);
+    mnp = rtpp_memdeb_nget(pvt, mlp, 1);
     if (mpf == NULL) {
         mnp->mstats.afails++;
         pthread_mutex_unlock(&pvt->mutex);
@@ -283,10 +311,13 @@ rtpp_memdeb_malloc(size_t size, void *p, const char *fname, int linen, const cha
     guard = MEMDEB_SIGNATURE_ALLOC(gp);
     _memcpy(gp, &guard, MEMDEB_GUARD_SIZE);
     return (mpf->real_data);
+glitched:
+    errno = ENOMEM;
+    return (NULL);
 }
 
 static struct memdeb_pfx *
-ptr2mpf(struct rtpp_memdeb_priv *pvt, void *ptr, struct memdeb_loc *mlp)
+ptr2mpf(struct rtpp_memdeb_priv *pvt, void *ptr, struct rtpp_codeptr *mlp)
 {
     char *cp;
     struct memdeb_pfx *mpf;
@@ -318,7 +349,7 @@ rtpp_memdeb_free(void *ptr, void *p, const char *fname, int linen, const char *f
     unsigned char *gp;
     uint64_t guard;
     struct rtpp_memdeb_priv *pvt;
-    struct memdeb_loc ml;
+    struct rtpp_codeptr ml;
 
     ml.fname = fname;
     ml.linen = linen;
@@ -363,15 +394,17 @@ rtpp_memdeb_realloc(void *ptr, size_t size, void *p, const char *fname, int line
     unsigned char *gp;
     uint64_t guard;
     struct rtpp_memdeb_priv *pvt;
-    struct memdeb_loc ml;
+    struct rtpp_codeptr ml;
 
     ml.fname = fname;
     ml.linen = linen;
     ml.funcn = funcn;
 
+    GLITCH_INJECT(&ml, glitched);
+
     CHK_PRIV_VRB(pvt, p, &ml);
     if (ptr == NULL) {
-        return (rtpp_memdeb_malloc(size, pvt, fname, linen, funcn));
+        return (rtpp_memdeb_imalloc(size, pvt, 1, &ml));
     }
     mpf = ptr2mpf(pvt, ptr, &ml);
     sig_save = MEMDEB_SIGNATURE_ALLOC(mpf);
@@ -384,7 +417,7 @@ rtpp_memdeb_realloc(void *ptr, size_t size, void *p, const char *fname, int line
         mpf->magic = sig_save;
         mpf->mnp->mstats.afails++;
         pthread_mutex_unlock(&pvt->mutex);
-        return (cp);
+        return (NULL);
     }
     new_mpf = (struct memdeb_pfx *)cp;
     if (new_mpf != mpf) {
@@ -401,6 +434,9 @@ rtpp_memdeb_realloc(void *ptr, size_t size, void *p, const char *fname, int line
     guard = MEMDEB_SIGNATURE_ALLOC(gp);
     _memcpy(gp, &guard, MEMDEB_GUARD_SIZE);
     return (new_mpf->real_data);
+glitched:
+    errno = ENOMEM;
+    return (NULL);
 }
 
 char *
@@ -413,11 +449,13 @@ rtpp_memdeb_strdup(const char *ptr, void *p, const char *fname, int linen, \
     unsigned char *gp;
     uint64_t guard;
     struct rtpp_memdeb_priv *pvt;
-    struct memdeb_loc ml;
+    struct rtpp_codeptr ml;
 
     ml.fname = fname;
     ml.linen = linen;
     ml.funcn = funcn;
+
+    GLITCH_INJECT(&ml, glitched);
 
     CHK_PRIV_VRB(pvt, p, &ml);
     size = strlen(ptr) + 1;
@@ -439,6 +477,9 @@ rtpp_memdeb_strdup(const char *ptr, void *p, const char *fname, int linen, \
     guard = MEMDEB_SIGNATURE_ALLOC(gp);
     _memcpy(gp, &guard, MEMDEB_GUARD_SIZE);
     return ((char *)mpf->real_data);
+glitched:
+    errno = ENOMEM;
+    return (NULL);
 }
 
 int
@@ -447,9 +488,14 @@ rtpp_memdeb_asprintf(char **pp, const char *fmt, void *p, const char *fname,
 {
     va_list ap;
     int rval;
+    struct rtpp_codeptr ml;
+
+    ml.fname = fname;
+    ml.linen = linen;
+    ml.funcn = funcn;
 
     va_start(ap, funcn);
-    rval = rtpp_memdeb_vasprintf(pp, fmt, p, fname, linen, funcn, ap);
+    rval = rtpp_memdeb_ivasprintf(pp, fmt, p, &ml, ap);
     va_end(ap);
     return (rval);
 }
@@ -458,14 +504,28 @@ int
 rtpp_memdeb_vasprintf(char **pp, const char *fmt, void *p, const char *fname,
   int linen, const char *funcn, va_list ap)
 {
+    struct rtpp_codeptr ml;
+
+    ml.fname = fname;
+    ml.linen = linen;
+    ml.funcn = funcn;
+    return (rtpp_memdeb_ivasprintf(pp, fmt, p, &ml, ap));
+}
+
+static int
+rtpp_memdeb_ivasprintf(char **pp, const char *fmt, void *p,
+  const struct rtpp_codeptr *mlp, va_list ap)
+{
     int rval;
     void *tp;
+
+    GLITCH_INJECT(mlp, glitched);
 
     rval = vasprintf(pp, fmt, ap);
     if (rval <= 0) {
         return (rval);
     }
-    tp = rtpp_memdeb_malloc(rval + 1, p, fname, linen, funcn);
+    tp = rtpp_memdeb_imalloc(rval + 1, p, 1, mlp);
     if (tp == NULL) {
         free(*pp);
         *pp = NULL;
@@ -475,13 +535,17 @@ rtpp_memdeb_vasprintf(char **pp, const char *fmt, void *p, const char *fname,
     free(*pp);
     *pp = tp;
     return (rval);
+glitched:
+    *pp = NULL;
+    errno = ENOMEM;
+    return (-1);
 }
 
 void *
 rtpp_memdeb_memcpy(void *dst, const void *src, size_t len, void *p,
   const char *fname, int linen, const char *funcn)
 {
-    struct memdeb_loc ml;
+    struct rtpp_codeptr ml;
     struct rtpp_memdeb_priv *pvt;
 
     CHK_PRIV(pvt, p);
@@ -502,8 +566,13 @@ rtpp_memdeb_calloc(size_t number, size_t size, void *p, \
   const char *fname, int linen, const char *funcn)
 {
     void *rp;
+    struct rtpp_codeptr ml;
 
-    rp = rtpp_memdeb_malloc(number * size, p, fname, linen, funcn);
+    ml.fname = fname;
+    ml.linen = linen;
+    ml.funcn = funcn;
+
+    rp = rtpp_memdeb_imalloc(number * size, p, 0, &ml);
     if (rp == NULL)
         return (NULL);
     memset(rp, '\0', number * size);
@@ -515,7 +584,7 @@ is_approved(struct rtpp_memdeb_priv *pvt, const char *funcn)
 {
     int i;
 
-    for (i = 0; pvt->au[i].funcn != NULL && i < MAX_APPROVED; i++) {
+    for (i = 0; i < MAX_APPROVED && pvt->au[i].funcn != NULL; i++) {
         if (strcmp(pvt->au[i].funcn, funcn) != 0)
             continue;
         return (pvt->au[i].max_nunalloc);
@@ -538,6 +607,20 @@ rtpp_memdeb_dumpstats(void *p, int nostdout)
     pthread_mutex_lock(&pvt->mutex);
     for (mnp = pvt->nodes; mnp != NULL; mnp = mnp->next) {
         nunalloc = mnp->mstats.nalloc - mnp->mstats.nfree;
+        /*
+         * A bit of hackish code below to compensate for logging object
+         * which we (obviously) cannot deallocate prior to call to this
+         * function.
+         */
+        if (pvt->_md_glog != NULL) {
+            struct rtpp_codeptr ml;
+
+            ml.fname = __FILE__;
+            ml.linen = __LINE__;
+            ml.funcn = __func__;
+            if (ptr2mpf(pvt, pvt->_md_glog, &ml)->mnp == mnp && nunalloc > 0)
+                nunalloc--;
+        }
         if (mnp->mstats.afails == 0) {
             if (mnp->mstats.nalloc == 0)
                 continue;

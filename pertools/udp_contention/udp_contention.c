@@ -34,13 +34,19 @@ rdtsc(void)
 void
 srandomdev(void)
 {
-    int fd;
+    int fd, rlen;
     unsigned long junk;
     struct timeval tv;
 
     fd = open("/dev/urandom", O_RDONLY, 0);
     if (fd >= 0) {
-        read(fd, &junk, sizeof(junk));
+        rlen = read(fd, &junk, sizeof(junk));
+        if (rlen < 0) {
+            warn("read(\"/dev/urandom\")");
+        } else if (rlen < sizeof(junk)) {
+            warnx("read(\"/dev/urandom\": short read %d bytes not %d)",
+              rlen, sizeof(junk));
+        }
         close(fd);
     } else {
         junk = 0;
@@ -208,13 +214,18 @@ socket_ctor(int domain, struct tconf *cfp)
 
     s = socket(domain, SOCK_DGRAM, 0);
     if (s == -1) {
-        return (-1);
+        goto e0;
     }
     if (cfp->sock_block == 0) {
         flags = fcntl(s, F_GETFL);
-        fcntl(s, F_SETFL, flags | O_NONBLOCK);
+        if (flags < 0 || fcntl(s, F_SETFL, flags | O_NONBLOCK) < 0)
+            goto e1;
     }
     return (s);
+e1:
+    close(s);
+e0:
+    return (-1);
 }
 
 static struct workset *
@@ -616,10 +627,11 @@ run_test(int nthreads, int test_type, struct tconf *cfp, struct tstats *tsp)
         rsp[i] = generate_recvset(wsp[i], cfp);
     }
     for (i = 0; i < nthreads; i++) {
-        pthread_create(&wsp[i]->tid, NULL, (void *(*)(void *))process_workset, wsp[i]);
-        pthread_create(&rsp[i]->tid, NULL, (void *(*)(void *))process_recvset, rsp[i]);
+        assert(pthread_create(&wsp[i]->tid, NULL, (void *(*)(void *))process_workset, wsp[i]) == 0);
+        assert(pthread_create(&rsp[i]->tid, NULL, (void *(*)(void *))process_recvset, rsp[i]) == 0);
     }
     nrecvd_total = nsent_total = send_nerrs_total = send_nshrts_total = 0;
+    rtt_total = 0;
     for (i = 0; i < nthreads; i++) {
         pthread_join(wsp[i]->tid, NULL);
         rsp[i]->done = 1;
@@ -643,12 +655,16 @@ run_test(int nthreads, int test_type, struct tconf *cfp, struct tstats *tsp)
     fprintf(stdout, "nsent_total=%ju, nsent_succ_total=%ju, nrecvd_total=%ju\n",
       (uintmax_t)nsent_total, (uintmax_t)nsent_succ_total,
       (uintmax_t)nrecvd_total);
-    tsp->ploss_ratio = (double)(nsent_succ_total - nrecvd_total) /
-      (double)(nsent_succ_total);
-    tsp->send_nerrs_ratio = (double)(send_nerrs_total) /
-      (double)(nsent_total);
-     tsp->send_nshrts_ratio = (double)(send_nshrts_total) /
-      (double)(nsent_total);
+    if (nsent_succ_total > 0) {
+        tsp->ploss_ratio = (double)(nsent_succ_total - nrecvd_total) /
+          (double)(nsent_succ_total);
+    }
+    if (nsent_total > 0) {
+        tsp->send_nerrs_ratio = (double)(send_nerrs_total) /
+          (double)(nsent_total);
+        tsp->send_nshrts_ratio = (double)(send_nshrts_total) /
+          (double)(nsent_total);
+    }
     return;
 }
 

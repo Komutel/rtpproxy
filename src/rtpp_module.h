@@ -25,9 +25,9 @@
  *
  */
 
-#define MODULE_API_REVISION 5
+#define MODULE_API_REVISION 8
 
-struct rtpp_cfg_stable;
+struct rtpp_cfg;
 struct rtpp_module_priv;
 struct rtpp_acct;
 struct rtpp_acct_rtcp;
@@ -38,7 +38,8 @@ struct rtpp_module_conf;
 #include "rtpp_types.h"
 #endif
 
-DEFINE_METHOD(rtpp_cfg_stable, rtpp_module_ctor, struct rtpp_module_priv *);
+DEFINE_RAW_METHOD(rtpp_module_ctor, struct rtpp_module_priv *,
+  const struct rtpp_cfg *);
 DEFINE_METHOD(rtpp_module_priv, rtpp_module_get_mconf, struct rtpp_module_conf *);
 DEFINE_METHOD(rtpp_module_priv, rtpp_module_config, int);
 DEFINE_METHOD(rtpp_module_priv, rtpp_module_dtor, void);
@@ -82,13 +83,14 @@ DEFINE_RAW_METHOD(rtpp_module_vasprintf, int, char **, const char *,
 #endif
 
 #define mod_log(args...) CALL_METHOD(rtpp_module.log, write, __FUNCTION__, \
-  ## args)
+  __LINE__, ## args)
 #define mod_elog(args...) CALL_METHOD(rtpp_module.log, ewrite, __FUNCTION__, \
-  ## args)
+  __LINE__, ## args)
 
 struct api_version {
     int rev;
     size_t mi_size;
+    const char *build;
 };
 
 struct api_on_sess_end {
@@ -130,6 +132,11 @@ struct rtpp_minfo {
 
 extern struct rtpp_minfo rtpp_module;
 
-#define MI_VER_INIT() {.rev = MODULE_API_REVISION, .mi_size = sizeof(rtpp_module)}
-#define MI_VER_CHCK(sptr) ((sptr)->ver.rev == MODULE_API_REVISION && \
-  (sptr)->ver.mi_size == sizeof(struct rtpp_minfo))
+#define MI_VER_INIT() { \
+    .rev = MODULE_API_REVISION, \
+    .mi_size = sizeof(rtpp_module), \
+    .build = RTPP_SW_VERSION}
+#define MI_VER_CHCK(sptr) ( \
+  (sptr)->ver.rev == MODULE_API_REVISION && \
+  (sptr)->ver.mi_size == sizeof(struct rtpp_minfo) && \
+  strcmp((sptr)->ver.build, RTPP_SW_VERSION) == 0)

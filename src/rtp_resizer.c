@@ -33,6 +33,7 @@
 #include "rtpp_endian.h"
 #include "rtp.h"
 #include "rtp_info.h"
+#include "rtpp_time.h"
 #include "rtp_packet.h"
 #include "rtp_resizer.h"
 #include "rtpp_proc.h"
@@ -40,6 +41,7 @@
 #include "rtpp_stats.h"
 #include "rtpp_mallocs.h"
 #include "rtpp_ssrc.h"
+#include "rtpp_refcnt.h"
 
 struct rtp_resizer {
     int         nsamples_total;
@@ -103,7 +105,7 @@ rtp_resizer_free(struct rtpp_stats *rtpp_stats, struct rtp_resizer *this)
     while (p != NULL) {
         p1 = p;
         p = p->next;
-        rtp_packet_free(p1);
+        RTPP_OBJ_DECREF(p1);
         nfree++;
     }
     free(this);
@@ -161,12 +163,12 @@ rtp_resizer_enqueue(struct rtp_resizer *this, struct rtp_packet **pkt,
     if (this->last_sent_ts_inited && ts_less((*pkt)->parsed->ts, this->last_sent_ts))
     {
         /* Packet arrived too late. Drop it. */
-        rtp_packet_free(*pkt);
+        RTPP_OBJ_DECREF(*pkt);
         *pkt = NULL;
         rsp->npkts_resizer_discard.cnt++;
         return;
     }
-    internal_ts = (*pkt)->rtime * 8000.0;
+    internal_ts = (*pkt)->rtime.mono * 8000.0;
     if (!this->tsdelta_inited) {
         this->tsdelta = (*pkt)->parsed->ts - internal_ts + 40;
         this->tsdelta_inited = 1;
@@ -331,6 +333,8 @@ rtp_resizer_get(struct rtp_resizer *this, double dtime)
 		    if (ret == NULL)
 			break;
 		    rtp_packet_dup(ret, p, RTPP_DUP_HDRONLY);
+                    /* Reset MBT if it happens to be set */
+                    p->data.header.mbt = 0;
 		    move_chunk(ret, p, &chunk);
 		    ++split;
 		}
@@ -362,7 +366,7 @@ rtp_resizer_get(struct rtp_resizer *this, double dtime)
 			break;
 		    append_packet(ret, p);
 		    detach_queue_head(this);
-		    rtp_packet_free(p);
+		    RTPP_OBJ_DECREF(p);
 		}
 		else {
 		    /* Prevent RTP packet buffer overflow */
@@ -399,7 +403,7 @@ rtp_resizer_get(struct rtp_resizer *this, double dtime)
         }
         else {
 	    append_packet(ret, p);
-            rtp_packet_free(p);
+            RTPP_OBJ_DECREF(p);
         }
 	/* Send non-appendable packet immediately */
 	if (!ret->parsed->appendable)

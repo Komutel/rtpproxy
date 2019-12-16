@@ -26,7 +26,7 @@
  *
  */
 
-#include <pthread.h>
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -37,11 +37,8 @@
 
 struct rtpp_genuid_priv {
     struct rtpp_genuid_obj pub;
-    uint64_t lastsuid;
-    pthread_mutex_t lastsuid_lock;
+    _Atomic(uint64_t) lastuid;
 };
-
-#define PUB2PVT(pubp)      ((struct rtpp_genuid_priv *)((char *)(pubp) - offsetof(struct rtpp_genuid_priv, pub)))
 
 static void rtpp_genuid_gen(struct rtpp_genuid_obj *, uint64_t *vp);
 static void rtpp_genuid_dtor(struct rtpp_genuid_obj *);
@@ -53,17 +50,14 @@ rtpp_genuid_ctor(void)
 
     pvt = rtpp_zmalloc(sizeof(struct rtpp_genuid_priv));
     if (pvt == NULL) {
-        return (NULL);
-    }
-    if (pthread_mutex_init(&pvt->lastsuid_lock, NULL) != 0) {
         goto e0;
     }
+    pvt->lastuid = ATOMIC_VAR_INIT(0);
     pvt->pub.dtor = &rtpp_genuid_dtor;
     pvt->pub.gen = &rtpp_genuid_gen;
     return (&pvt->pub);
 
 e0:
-    free(pvt);
     return (NULL);
 }
 
@@ -72,9 +66,8 @@ rtpp_genuid_dtor(struct rtpp_genuid_obj *pub)
 {
     struct rtpp_genuid_priv *pvt;
 
-    pvt = PUB2PVT(pub);
+    PUB2PVT(pub, pvt);
 
-    pthread_mutex_destroy(&pvt->lastsuid_lock);
     free(pvt);
 }
 
@@ -83,9 +76,8 @@ rtpp_genuid_gen(struct rtpp_genuid_obj *pub, uint64_t *vp)
 {
     struct rtpp_genuid_priv *pvt;
 
-    pvt = PUB2PVT(pub);
+    PUB2PVT(pub, pvt);
 
-    pthread_mutex_lock(&pvt->lastsuid_lock);
-    *vp = ++(pvt->lastsuid);
-    pthread_mutex_unlock(&pvt->lastsuid_lock);
+    *vp = atomic_fetch_add_explicit(&(pvt->lastuid), 1,
+      memory_order_relaxed);
 }

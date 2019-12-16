@@ -38,11 +38,12 @@
 #include "rtpp_types.h"
 #include "rtpp_log.h"
 #include "rtpp_log_obj.h"
-#include "rtpp_cfg_stable.h"
-#include "rtpp_defines.h"
+#include "rtpp_cfg.h"
 #include "rtpp_acct_pipe.h"
 #include "rtpp_acct.h"
 #include "rtpp_analyzer.h"
+#include "rtpp_command.h"
+#include "rtpp_time.h"
 #include "rtpp_command_private.h"
 #include "rtpp_genuid_singlet.h"
 #include "rtpp_hash_table.h"
@@ -54,9 +55,9 @@
 #include "rtpp_session.h"
 #include "rtpp_sessinfo.h"
 #include "rtpp_stats.h"
-#include "rtpp_time.h"
 #include "rtpp_ttl.h"
 #include "rtpp_refcnt.h"
+#include "rtpp_timeout_data.h"
 
 struct rtpp_session_priv
 {
@@ -66,30 +67,25 @@ struct rtpp_session_priv
     struct rtpp_acct *acct;
 };
 
-#define PUB2PVT(pubp) \
-  ((struct rtpp_session_priv *)((char *)(pubp) - offsetof(struct rtpp_session_priv, pub)))
-
 static void rtpp_session_dtor(struct rtpp_session_priv *);
 
 struct rtpp_session *
-rtpp_session_ctor(struct rtpp_cfg_stable *cfs, struct common_cmd_args *ccap,
-  double dtime, struct sockaddr **lia, int weak, int lport,
-  struct rtpp_socket **fds)
+rtpp_session_ctor(const struct rtpp_cfg *cfs, struct common_cmd_args *ccap,
+  const struct rtpp_timestamp *dtime, const struct sockaddr **lia, int weak,
+  int lport, struct rtpp_socket **fds)
 {
     struct rtpp_session_priv *pvt;
     struct rtpp_session *pub;
     struct rtpp_log *log;
-    struct rtpp_refcnt *rcnt;
     int i;
     char *cp;
 
-    pvt = rtpp_rzmalloc(sizeof(struct rtpp_session_priv), &rcnt);
+    pvt = rtpp_rzmalloc(sizeof(struct rtpp_session_priv), PVT_RCOFFS(pvt));
     if (pvt == NULL) {
         goto e0;
     }
 
     pub = &(pvt->pub);
-    pub->rcnt = rcnt;
     rtpp_gen_uid(&pub->seuid);
 
     log = rtpp_log_ctor("rtpproxy", ccap->call_id, 0);
@@ -113,7 +109,8 @@ rtpp_session_ctor(struct rtpp_cfg_stable *cfs, struct common_cmd_args *ccap,
     if (pvt->acct == NULL) {
         goto e4;
     }
-    pvt->acct->init_ts = dtime;
+    pvt->acct->init_ts->wall = dtime->wall;
+    pvt->acct->init_ts->mono = dtime->mono;
     pub->call_id = strdup(ccap->call_id);
     if (pub->call_id == NULL) {
         goto e5;
@@ -149,11 +146,11 @@ rtpp_session_ctor(struct rtpp_cfg_stable *cfs, struct common_cmd_args *ccap,
             }
         } else {
             pub->rtp->stream[i]->ttl = pub->rtp->stream[0]->ttl;
-            CALL_SMETHOD(pub->rtp->stream[0]->ttl->rcnt, incref);
+            RTPP_OBJ_INCREF(pub->rtp->stream[0]->ttl);
         }
         /* RTCP shares the same TTL */
         pub->rtcp->stream[i]->ttl = pub->rtp->stream[i]->ttl;
-        CALL_SMETHOD(pub->rtp->stream[i]->ttl->rcnt, incref);
+        RTPP_OBJ_INCREF(pub->rtp->stream[i]->ttl);
     }
     for (i = 0; i < 2; i++) {
         pub->rtp->stream[i]->stuid_rtcp = pub->rtcp->stream[i]->stuid;
@@ -167,7 +164,7 @@ rtpp_session_ctor(struct rtpp_cfg_stable *cfs, struct common_cmd_args *ccap,
         struct rtpp_module_if *mif;
 
         mif = RTPP_LIST_HEAD(cfs->modules_cf);
-        CALL_SMETHOD(mif->rcnt, incref);
+        RTPP_OBJ_INCREF(mif);
         pvt->modules_cf = mif;
     }
 
@@ -184,22 +181,19 @@ e7:
 e6:
     free(pub->call_id);
 e5:
-    CALL_SMETHOD(pvt->acct->rcnt, decref);
+    RTPP_OBJ_DECREF(pvt->acct);
 e4:
-    CALL_SMETHOD(pub->rtcp->rcnt, decref);
+    RTPP_OBJ_DECREF(pub->rtcp);
 e3:
-    CALL_SMETHOD(pub->rtp->rcnt, decref);
+    RTPP_OBJ_DECREF(pub->rtp);
 e2:
-    CALL_SMETHOD(log->rcnt, decref);
+    RTPP_OBJ_DECREF(log);
 e1:
-    CALL_SMETHOD(pub->rcnt, decref);
+    RTPP_OBJ_DECREF(pub);
     free(pvt);
 e0:
     return (NULL);
 }
-
-#define MT2RT_NZ(mt) ((mt) == 0.0 ? 0.0 : dtime2rtime(mt))
-#define DRTN_NZ(bmt, emt) ((emt) == 0.0 || (bmt) == 0.0 ? 0.0 : ((emt) - (bmt)))
 
 static void
 rtpp_session_dtor(struct rtpp_session_priv *pvt)
@@ -209,8 +203,8 @@ rtpp_session_dtor(struct rtpp_session_priv *pvt)
     struct rtpp_session *pub;
 
     pub = &(pvt->pub);
-    pvt->acct->destroy_ts = getdtime();
-    session_time = pvt->acct->destroy_ts - pvt->acct->init_ts;
+    rtpp_timestamp_get(pvt->acct->destroy_ts);
+    session_time = pvt->acct->destroy_ts->mono - pvt->acct->init_ts->mono;
 
     CALL_METHOD(pub->rtp, get_stats, &pvt->acct->rtp);
     CALL_METHOD(pub->rtcp, get_stats, &pvt->acct->rtcp);
@@ -241,13 +235,13 @@ rtpp_session_dtor(struct rtpp_session_priv *pvt)
           pvt->acct->jrasta);
 
         CALL_METHOD(pvt->modules_cf, do_acct, pvt->acct);
-        CALL_SMETHOD(pvt->modules_cf->rcnt, decref);
+        RTPP_OBJ_DECREF(pvt->modules_cf);
     }
-    CALL_SMETHOD(pvt->acct->rcnt, decref);
+    RTPP_OBJ_DECREF(pvt->acct);
 
-    CALL_SMETHOD(pvt->pub.log->rcnt, decref);
-    if (pvt->pub.timeout_data.notify_tag != NULL)
-        free(pvt->pub.timeout_data.notify_tag);
+    RTPP_OBJ_DECREF(pvt->pub.log);
+    if (pvt->pub.timeout_data != NULL)
+        RTPP_OBJ_DECREF(pvt->pub.timeout_data);
     if (pvt->pub.call_id != NULL)
         free(pvt->pub.call_id);
     if (pvt->pub.tag != NULL)
@@ -255,8 +249,8 @@ rtpp_session_dtor(struct rtpp_session_priv *pvt)
     if (pvt->pub.tag_nomedianum != NULL)
         free(pvt->pub.tag_nomedianum);
 
-    CALL_SMETHOD(pvt->pub.rtcp->rcnt, decref);
-    CALL_SMETHOD(pvt->pub.rtp->rcnt, decref);
+    RTPP_OBJ_DECREF(pvt->pub.rtcp);
+    RTPP_OBJ_DECREF(pvt->pub.rtp);
     free(pvt);
 }
 
@@ -326,15 +320,15 @@ rtpp_session_ematch(void *dp, void *ap)
     return (RTPP_HT_MATCH_CONT);
 
 found:
-    CALL_SMETHOD(rsp->rcnt, incref);
+    RTPP_OBJ_INCREF(rsp);
     RTPP_DBG_ASSERT(map->sp == NULL);
     map->sp = rsp;
     return (RTPP_HT_MATCH_BRK);
 }
 
 int
-find_stream(struct cfg *cf, const char *call_id, const char *from_tag,
-  const char *to_tag, struct rtpp_session **spp)
+find_stream(const struct rtpp_cfg *cfsp, const char *call_id,
+  const char *from_tag, const char *to_tag, struct rtpp_session **spp)
 {
     struct session_match_args ma;
 
@@ -343,7 +337,7 @@ find_stream(struct cfg *cf, const char *call_id, const char *from_tag,
     ma.to_tag = to_tag;
     ma.rval = -1;
 
-    CALL_METHOD(cf->stable->sessions_ht, foreach_key, call_id,
+    CALL_METHOD(cfsp->sessions_ht, foreach_key, call_id,
       rtpp_session_ematch, &ma);
     if (ma.rval != -1) {
         *spp = ma.sp;

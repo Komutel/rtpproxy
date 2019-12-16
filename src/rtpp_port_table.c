@@ -50,22 +50,17 @@ struct rtpp_ptbl_priv {
 static void rtpp_ptbl_dtor(struct rtpp_ptbl_priv *);
 static int rtpp_ptbl_get_port(struct rtpp_port_table *, rtpp_pt_use_t, void *);
 
-#define PUB2PVT(pubp) \
-  ((struct rtpp_ptbl_priv *)((char *)(pubp) - offsetof(struct rtpp_ptbl_priv, pub)))
-
 struct rtpp_port_table *
 rtpp_port_table_ctor(int port_min, int port_max, int seq_ports, uint16_t port_ctl)
 {
     struct rtpp_ptbl_priv *pvt;
-    struct rtpp_refcnt *rcnt;
     int i, j;
     uint16_t portnum;
 
-    pvt = rtpp_rzmalloc(sizeof(struct rtpp_ptbl_priv), &rcnt);
+    pvt = rtpp_rzmalloc(sizeof(struct rtpp_ptbl_priv), PVT_RCOFFS(pvt));
     if (pvt == NULL) {
         goto e0;
     }
-    pvt->pub.rcnt = rcnt;
     if (pthread_mutex_init(&pvt->lock, NULL) != 0) {
         goto e1;
     }
@@ -103,7 +98,7 @@ rtpp_port_table_ctor(int port_min, int port_max, int seq_ports, uint16_t port_ct
 e2:
     pthread_mutex_destroy(&pvt->lock);
 e1:
-    CALL_SMETHOD(pvt->pub.rcnt, decref);
+    RTPP_OBJ_DECREF(&(pvt->pub));
     free(pvt);
 e0:
     return (NULL);
@@ -126,7 +121,7 @@ rtpp_ptbl_get_port(struct rtpp_port_table *self, rtpp_pt_use_t use_port, void *u
     int i, j, idx, rval;
     uint16_t port;
 
-    pvt = PUB2PVT(self);
+    PUB2PVT(self, pvt);
 
     pthread_mutex_lock(&pvt->lock);
     for (i = 1; i < pvt->port_table_len; i++) {

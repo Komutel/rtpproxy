@@ -39,47 +39,39 @@
 #include "rtpp_refcnt.h"
 #include "rtpp_acct_rtcp.h"
 #include "rtp.h"
+#include "rtpp_time.h"
 #include "rtp_packet.h"
 
 struct rtpp_acct_rtcp_priv {
-    struct rtpa_stats_jitter _jt;
     struct rtpp_acct_rtcp pub;
+    struct rtpa_stats_jitter _jt;
 };
 
 static void rtpp_acct_rtcp_dtor(struct rtpp_acct_rtcp_priv *);
-
-#define PUB2PVT(pubp) \
-  ((struct rtpp_acct_rtcp_priv *)((char *)(pubp) - offsetof(struct rtpp_acct_rtcp_priv, pub)))
 
 struct rtpp_acct_rtcp *
 rtpp_acct_rtcp_ctor(const char *call_id, const struct rtp_packet *pp)
 {
     struct rtpp_acct_rtcp_priv *pvt;
-    struct rtpp_refcnt *rcnt;
 
-    pvt = rtpp_rzmalloc(sizeof(struct rtpp_acct_rtcp_priv), &rcnt);
+    pvt = rtpp_rzmalloc(sizeof(struct rtpp_acct_rtcp_priv), PVT_RCOFFS(pvt));
     if (pvt == NULL) {
         goto e0;
     }
-    pvt->pub.rcnt = rcnt;
-    pvt->pub.pkt = rtp_packet_alloc();
-    if (pvt->pub.pkt == NULL) {
-        goto e1;
-    }
-    rtp_packet_dup(pvt->pub.pkt, pp, 0);
+    RTPP_OBJ_INCREF(pp);
+    pvt->pub.pkt = pp;
     pvt->pub.call_id = strdup(call_id);
     if (pvt->pub.call_id == NULL) {
-        goto e2;
+        goto e1;
     }
     pvt->pub.jt = &pvt->_jt;
     CALL_SMETHOD(pvt->pub.rcnt, attach, (rtpp_refcnt_dtor_t)&rtpp_acct_rtcp_dtor,
       pvt);
     return ((&pvt->pub));
 
-e2:
-    rtp_packet_free(pvt->pub.pkt);
 e1:
-    CALL_SMETHOD(pvt->pub.rcnt, decref);
+    RTPP_OBJ_DECREF(pvt->pub.pkt);
+    RTPP_OBJ_DECREF(&(pvt->pub));
     free(pvt);
 e0:
     return (NULL);
@@ -90,14 +82,7 @@ rtpp_acct_rtcp_dtor(struct rtpp_acct_rtcp_priv *pvt)
 {
 
     /*rtpp_acct_rtcp_fin(&(pvt->pub));*/
-    free(pvt->pub.call_id);
-    rtp_packet_free(pvt->pub.pkt);
+    free((void *)pvt->pub.call_id);
+    RTPP_OBJ_DECREF(pvt->pub.pkt);
     free(pvt);
-}
-
-const unsigned int
-rtpp_acct_rtcp_osize(void)
-{
-
-    return (sizeof(struct rtpp_acct_rtcp_priv));
 }

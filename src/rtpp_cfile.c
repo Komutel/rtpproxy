@@ -33,7 +33,7 @@
 
 #include "config_pp.h"
 
-#include "rtpp_cfg_stable.h"
+#include "rtpp_cfg.h"
 #include "rtpp_types.h"
 #include "rtpp_cfile.h"
 #include "rtpp_list.h"
@@ -45,7 +45,7 @@
 
 #include "ucl.h"
 
-static int parse_modules(struct rtpp_cfg_stable *, const ucl_object_t *);
+static int parse_modules(const struct rtpp_cfg *, const ucl_object_t *);
 static bool conf_helper_mapper(struct rtpp_log *, const ucl_object_t *,
   const conf_helper_map *, void *, const conf_helper_map **);
 
@@ -65,7 +65,7 @@ rtpp_module_dsop_canonic(const char *mname, char *buf, size_t blen)
 }
 
 int
-rtpp_cfile_process(struct rtpp_cfg_stable *csp)
+rtpp_cfile_process(const struct rtpp_cfg *csp)
 {
     struct ucl_parser *parser;
     ucl_object_t *conf_root;
@@ -120,6 +120,9 @@ rtpp_cfile_process(struct rtpp_cfg_stable *csp)
             }
         }
     }
+    if (ucl_object_iter_chk_excpn(it_conf)) {
+        ecode = -1;
+    }
 e4:
     ucl_object_iterate_free(it_conf);
 e3:
@@ -138,7 +141,7 @@ static const conf_helper_map default_module_map[] = {
 };
 
 static int
-parse_modules(struct rtpp_cfg_stable *csp, const ucl_object_t *wop)
+parse_modules(const struct rtpp_cfg *csp, const ucl_object_t *wop)
 {
     ucl_object_iter_t it_conf;
     const ucl_object_t *obj_file;
@@ -220,10 +223,14 @@ parse_modules(struct rtpp_cfg_stable *csp, const ucl_object_t *wop)
         continue;
 e1:
         ecode = -1;
-        CALL_SMETHOD(mif->rcnt, decref);
+        RTPP_OBJ_DECREF(mif);
         goto e0;
     }
 e0:
+    if (ucl_object_iter_chk_excpn(it_conf)) {
+        RTPP_LOG(csp->glog, RTPP_LOG_ERR, "UCL has failed with an internal error");
+        ecode = -1;
+    }
     ucl_object_iterate_free(it_conf);
     return (ecode);
 }
@@ -262,6 +269,8 @@ conf_helper_mapper(struct rtpp_log *log, const ucl_object_t *obj, const conf_hel
                 *fentrpp = &map[i];
         }
     }
+    if (cur == NULL && ucl_object_iter_chk_excpn(it))
+        ret = false;
     ucl_object_iterate_free(it);
     return (ret);
 }

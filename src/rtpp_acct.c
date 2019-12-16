@@ -32,7 +32,8 @@
 #include "rtpp_ssrc.h"
 #include "rtpa_stats.h"
 #include "rtpp_types.h"
-#include "rtpp_pcnt_strm.h"
+#include "rtpp_time.h"
+#include "rtpp_pcnts_strm.h"
 #include "rtpp_pcount.h"
 #include "rtpp_mallocs.h"
 #include "rtpp_refcnt.h"
@@ -51,32 +52,29 @@ struct rtpp_acct_pipe_s {
 };
 
 struct rtpp_acct_priv {
+    struct rtpp_acct pub;
     struct rtpp_acct_pipe_s _rtp;
     struct rtpp_acct_pipe_s _rtcp;
     struct rtpa_stats _rasto;
     struct rtpa_stats _rasta;
     struct rtpa_stats_jitter _jrasto;
     struct rtpa_stats_jitter _jrasta;
-    struct rtpp_acct pub;
+    struct rtpp_timestamp _init_ts;
+    struct rtpp_timestamp _destroy_ts;
 };
 
 static void rtpp_acct_dtor(struct rtpp_acct_priv *);
-
-#define PUB2PVT(pubp) \
-  ((struct rtpp_acct_priv *)((char *)(pubp) - offsetof(struct rtpp_acct_priv, pub)))
 
 struct rtpp_acct *
 rtpp_acct_ctor(uint64_t seuid)
 {
     struct rtpp_acct_priv *pvt;
-    struct rtpp_refcnt *rcnt;
 
-    pvt = rtpp_rzmalloc(sizeof(struct rtpp_acct_priv), &rcnt);
+    pvt = rtpp_rzmalloc(sizeof(struct rtpp_acct_priv), PVT_RCOFFS(pvt));
     if (pvt == NULL) {
         goto e0;
     }
     pvt->pub.seuid = seuid;
-    pvt->pub.rcnt = rcnt;
     pvt->pub.rtp.pcnts = &pvt->_rtp.pcnts;
     pvt->pub.rtcp.pcnts = &pvt->_rtcp.pcnts;
     pvt->pub.rtp.o.ps = &pvt->_rtp.o.ps;
@@ -87,6 +85,8 @@ rtpp_acct_ctor(uint64_t seuid)
     pvt->pub.rasta = &pvt->_rasta;
     pvt->pub.jrasto = &pvt->_jrasto;
     pvt->pub.jrasta = &pvt->_jrasta;
+    pvt->pub.init_ts = &pvt->_init_ts;
+    pvt->pub.destroy_ts = &pvt->_destroy_ts;
     CALL_SMETHOD(pvt->pub.rcnt, attach, (rtpp_refcnt_dtor_t)&rtpp_acct_dtor,
       pvt);
     return ((&pvt->pub));
@@ -105,13 +105,13 @@ rtpp_acct_dtor(struct rtpp_acct_priv *pvt)
     if (pvt->pub.from_tag != NULL)
         free(pvt->pub.from_tag);
     if (pvt->pub.rtp.a.rem_addr != NULL)
-        CALL_SMETHOD(pvt->pub.rtp.a.rem_addr->rcnt, decref);
+        RTPP_OBJ_DECREF(pvt->pub.rtp.a.rem_addr);
     if (pvt->pub.rtp.o.rem_addr != NULL)
-        CALL_SMETHOD(pvt->pub.rtp.o.rem_addr->rcnt, decref);
+        RTPP_OBJ_DECREF(pvt->pub.rtp.o.rem_addr);
     if (pvt->pub.rtcp.a.rem_addr != NULL)
-        CALL_SMETHOD(pvt->pub.rtcp.a.rem_addr->rcnt, decref);
+        RTPP_OBJ_DECREF(pvt->pub.rtcp.a.rem_addr);
     if (pvt->pub.rtcp.o.rem_addr != NULL)
-        CALL_SMETHOD(pvt->pub.rtcp.o.rem_addr->rcnt, decref);
+        RTPP_OBJ_DECREF(pvt->pub.rtcp.o.rem_addr);
     free(pvt);
 }
 

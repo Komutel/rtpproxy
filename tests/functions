@@ -15,22 +15,31 @@ TOP_BUILDDIR="${TOP_BUILDDIR:-${BASEDIR}/..}"
 PYTHON_DIR="${TOP_BUILDDIR}/python"
 SIPPY_DIR="${PYTHON_DIR}/sippy_lite"
 
+PYINT=${PYINT:-"python3"}
+
 RTPPROXY=${TOP_BUILDDIR}/src/rtpproxy_debug
-RTPP_QUERY=${SIPPY_DIR}/sippy/tools/rtpp_query.py
-RTPP_NOTYFY_CLIENT=${TOP_BUILDDIR}/python/rtpp_notify_client.py
+RTPP_QUERY="${PYINT} ${SIPPY_DIR}/sippy/tools/rtpp_query.py -n 1"
+RTPP_NOTYFY_CLIENT="${PYINT} ${TOP_BUILDDIR}/python/rtpp_notify_client.py -S ${TOP_BUILDDIR}/python/sippy_lite"
 
 setup_tstart() {
-  RTPP_MCLOCK_NAME="`${RTPPROXY} -C 2>/dev/null`"
+  RTPP_MCLOCK_NAME="`RTPP_GLITCH_ACT="" ${RTPPROXY} -C 2>/dev/null`"
   if [ "${RTPP_MCLOCK_NAME}" = "" ]
   then
     echo "oops, cannot determine clock name to synchronize logs!" 1>&2
     exit 1
   fi
-  RTPP_LOG_TSTART="`python ${SIPPY_DIR}/sippy/tools/getmonotime.py -S ${SIPPY_DIR} \
+  RTPP_LOG_TSTART="`${PYINT} ${SIPPY_DIR}/sippy/tools/getmonotime.py -S ${SIPPY_DIR} \
    -C ${RTPP_MCLOCK_NAME}`"
   export RTPP_LOG_TSTART
   RTPP_LOG_TFORM="rel"
   export RTPP_LOG_TFORM
+}
+
+assign_test_sockets() {
+  RTPP_TEST_SOCKETS="stdio: udp:${IPV4_LHOST}:${RTPP_TEST_SOCK_UDP4_PORT} \
+   unix:${RTPP_TEST_SOCK_UNIX} tcp:${IPV4_LHOST}:${RTPP_TEST_SOCK_TCP4_PORT} \
+   cunix:${RTPP_TEST_SOCK_CUNIX} udp6:${IPV6_LHOST}:${RTPP_TEST_SOCK_UDP6_PORT} \
+   tcp6:${IPV6_LHOST}:${RTPP_TEST_SOCK_TCP6_PORT}"
 }
 
 if [ "${RTPP_LOG_TSTART}" = "" ]
@@ -38,33 +47,46 @@ then
   setup_tstart
 fi
 
+IPV4_LHOST="127.0.0.1"
+IPV6_LHOST="::1"
+
 RTPP_NOTIFY_SOCK_UNIX_SHRT="/tmp/rtpp_nc.sock"
 RTPP_NOTIFY_SOCK_UNIX="unix:${RTPP_NOTIFY_SOCK_UNIX_SHRT}"
-RTPP_NOTIFY_SOCK_TCP="tcp:127.0.0.1:9642"
+RTPP_NOTIFY_SOCK_TCP="tcp:${IPV4_LHOST}:9642"
 RTPP_NOTIFY_SOCK_WILD="tcp:%%CC_SELF%%:9643"
-RTPP_NOTIFY_SOCK_WILD_BIND="tcp:127.0.0.1:9643"
+RTPP_NOTIFY_SOCK_WILD_BIND="tcp:${IPV4_LHOST}:9643"
 
 RTPP_TEST_SOCK_UDP4_PORT=${RTPP_TEST_SOCK_UDP4_PORT:-37223}
 RTPP_TEST_SOCK_UDP6_PORT=${RTPP_TEST_SOCK_UDP6_PORT:-43863}
+RTPP_TEST_SOCK_TCP4_PORT=${RTPP_TEST_SOCK_TCP4_PORT:-32273}
+RTPP_TEST_SOCK_TCP6_PORT=${RTPP_TEST_SOCK_TCP6_PORT:-36834}
 RTPP_TEST_SOCK_UNIX=${RTPP_TEST_SOCK_UNIX:-/tmp/rtpproxy.sock}
 RTPP_TEST_SOCK_CUNIX=${RTPP_TEST_SOCK_CUNIX:-/tmp/rtpproxy.csock}
-RTPP_TEST_SOCKETS="stdio: udp:127.0.0.1:${RTPP_TEST_SOCK_UDP4_PORT} \
-  unix:${RTPP_TEST_SOCK_UNIX} \
-  cunix:${RTPP_TEST_SOCK_CUNIX} udp6:::1:${RTPP_TEST_SOCK_UDP6_PORT}"
+if [ -z "${RTPP_TEST_SOCKETS}" ]
+then
+  assign_test_sockets
+fi
 MAKEANN=${TOP_BUILDDIR}/makeann/makeann
-EXTRACTAUDIO=${TOP_BUILDDIR}/extractaudio/extractaudio
+EXTRACTAUDIO=${TOP_BUILDDIR}/extractaudio/extractaudio_debug
 DIFF="diff -u"
 TCPDUMP="tcpdump"
 TAR="tar"
 
 TRASH_PORT1=38322
 
-if [ ${MYUID} -eq 0 ]
+SUDO_REQUIRED=${SUDO_REQUIRED:-0}
+if [ ${MYUID} -eq 0 -o ${SUDO_REQUIRED} -eq 0 ]
 then
   SUDO=""
 else
   SUDO="sudo -n"
+  if ! ${SUDO} true
+  then
+    echo "\"${SUDO}\" is not working"
+    exit 1
+  fi
 fi
+SUDO_SHCMD="${SUDO} sh -c"
 
 if [ "${OS}" != "FreeBSD" ]
 then
@@ -92,14 +114,35 @@ sha256_compute() {
 setup_buffers() {
   if [ "${OS}" != "FreeBSD" ]
   then
-    ${SUDO} -s "echo 49600 > /proc/sys/net/ipv4/udp_rmem_min"
-    ${SUDO} sysctl -w net.ipv4.udp_rmem_min=49600
-    ${SUDO} -s "echo 49600 > /proc/sys/net/ipv4/udp_wmem_min"
-    ${SUDO} sysctl -w net.ipv4.udp_wmem_min=49600
-    ${SUDO} -s "echo 33554432 > /proc/sys/net/core/rmem_max"
-    ${SUDO} sysctl -w net.core.rmem_max=33554432
-    ${SUDO} -s "echo 33554432 > /proc/sys/net/core/rmem_default"
-    ${SUDO} sysctl -w net.core.rmem_default=33554432
+    for rwmod in "r" "w"
+    do
+      if [ -e "/proc/sys/net/ipv4/udp_${rwmod}mem_min" ]
+      then
+        ${SUDO_SHCMD} "echo 4194304 > /proc/sys/net/ipv4/udp_${rwmod}mem_min"
+      else
+        ${SUDO} sysctl -w net.ipv4.udp_${rwmod}mem_min=4194304
+      fi
+      if [ -e "/proc/sys/net/core/${rwmod}mem_max" ]
+      then
+        ${SUDO_SHCMD} "echo 33554432 > /proc/sys/net/core/${rwmod}mem_max"
+      else
+        ${SUDO} sysctl -w net.core.${rwmod}mem_max=33554432
+      fi
+      if [ -e "/proc/sys/net/core/${rwmod}mem_default" ]
+      then
+        ${SUDO_SHCMD} "echo 33554432 > /proc/sys/net/core/${rwmod}mem_default"
+      else
+        ${SUDO} sysctl -w net.core.${rwmod}mem_default=33554432
+      fi
+    done
+  fi
+}
+
+setup_test_net_3() {
+  if [ "${OS}" != "FreeBSD" ]
+  then
+    ${SUDO} iptables -I INPUT -s 203.0.113.0/24 -j DROP
+    ${SUDO} iptables -I OUTPUT  -d 203.0.113.0/24 -j DROP
   fi
 }
 
@@ -116,6 +159,20 @@ sha256_verify() {
     ok "${1} data"
   else
     fail "${1} data"
+  fi
+}
+
+disable_aslr() {
+  if [ "${OS}" != "FreeBSD" ]
+  then
+    if [ -e /proc/sys/kernel/randomize_va_space ]
+    then
+      cval=$((`cat /proc/sys/kernel/randomize_va_space`))
+      if [ ${cval} -ne 0 ]
+      then
+        ${SUDO_SHCMD} "echo 0 > /proc/sys/kernel/randomize_va_space"
+      fi
+    fi
   fi
 }
 
@@ -138,10 +195,10 @@ rtpproxy_start() {
   RTPP_RUNDIR=`pwd`
   if [ ! -z "${RTPP_OUTFILE}" ]
   then
-    ${RTPPROXY} -D -F -s ${TMP_SOCKFILE} -p ${TMP_PIDFILE} -d info ${RTPP_ARGS} \
+    ${RTPPROXY} -D -F -s ${TMP_SOCKFILE} -p ${TMP_PIDFILE} -d info "${@}" \
      >${RTPP_OUTFILE} 2>${TMP_LOGFILE}
   else
-    ${RTPPROXY} -D -F -s ${TMP_SOCKFILE} -p ${TMP_PIDFILE} -d info ${RTPP_ARGS} \
+    ${RTPPROXY} -D -F -s ${TMP_SOCKFILE} -p ${TMP_PIDFILE} -d info "${@}" \
      2>${TMP_LOGFILE}
   fi
   RC=${?}
@@ -151,9 +208,7 @@ rtpproxy_start() {
     then
       cat ${TMP_LOGFILE} >&2
     fi
-    rm ${TMP_LOGFILE}
-    false
-    return
+    return 1
   fi  
   export TMP_PIDFILE
   export TMP_SOCKFILE
@@ -165,11 +220,10 @@ rtpproxy_start() {
     if [ ${_i} -eq 3 ]
     then
       cat ${TMP_LOGFILE} >&2
-      rm ${TMP_LOGFILE}
-      false
-      return
+      return 1
     fi
   done
+  return 0
 }
 
 rtpproxy_stop() {
@@ -192,8 +246,11 @@ rtpproxy_stop() {
     if [ ${_i} -eq 3 ]
     then
       kill -KILL `cat ${TMP_PIDFILE}`
-      cat ${TMP_LOGFILE} >&2
-      rm ${TMP_LOGFILE}
+      if [ "${TMP_LOGFILE}" != "/dev/null" ]
+      then
+        cat "${TMP_LOGFILE}" >&2
+        rm "${TMP_LOGFILE}"
+      fi
       false
       return
     fi
@@ -217,7 +274,7 @@ witness_start() {
         ${SUDO} rm ${file}
       fi
     done
-    ${SUDO} sh -c "echo \${$} > /tmp/witness.pid && exec ${TCPDUMP} -B 4096 -w ${PCAP_NAME} -s0 -ni ${LOOPBACK_INTERFACE} udp and not port ${TRASH_PORT1} 2>/dev/null" &
+    ${SUDO_SHCMD} "echo \${$} > /tmp/witness.pid && exec ${TCPDUMP} -B 4096 -w ${PCAP_NAME} -s0 -ni ${LOOPBACK_INTERFACE} udp and not port ${TRASH_PORT1} 2>/dev/null" &
     while [ ! -e ${PCAP_NAME} ]
     do
       sleep 1
@@ -263,6 +320,7 @@ forcefail() {
     fi
   fi
   witness_stop
+  __beforeexit_cleanup 2>/dev/null || true
   exit $RC
 }
 

@@ -33,13 +33,15 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stddef.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "config.h"
+#include "config_pp.h"
 
+#include "rtpp_cfg.h"
 #include "rtpp_ssrc.h"
 #include "rtpa_stats.h"
 #include "rtpp_log.h"
@@ -50,7 +52,13 @@
 #include "rtpp_acct.h"
 #include "rtpp_acct_rtcp.h"
 #include "rtpp_pcount.h"
-#include "rtpp_pcnt_strm.h"
+#include "rtpp_time.h"
+#include "rtpp_pcnts_strm.h"
+#include "rtpp_stream.h"
+#include "rtpp_pipe.h"
+#include "rtpp_session.h"
+#include "advanced/packet_observer.h"
+#include "advanced/po_manager.h"
 #define MODULE_IF_CODE
 #include "rtpp_module.h"
 #include "rtpp_module_if.h"
@@ -58,6 +66,8 @@
 #include "rtpp_queue.h"
 #include "rtpp_refcnt.h"
 #include "rtpp_wi.h"
+#include "rtpp_wi_apis.h"
+#include "rtpp_wi_sgnl.h"
 #ifdef RTPP_CHECK_LEAKS
 #include "rtpp_memdeb_internal.h"
 #endif
@@ -86,15 +96,12 @@ static int rtpp_module_vasprintf(char **, const char *, void *, const char *,
   int, const char *, va_list);
 #endif
 static void rtpp_mif_run(void *);
-static int rtpp_mif_load(struct rtpp_module_if *, struct rtpp_cfg_stable *, struct rtpp_log *);
-static int rtpp_mif_start(struct rtpp_module_if *);
+static int rtpp_mif_load(struct rtpp_module_if *, const struct rtpp_cfg *, struct rtpp_log *);
+static int rtpp_mif_start(struct rtpp_module_if *, const struct rtpp_cfg *);
 static void rtpp_mif_do_acct(struct rtpp_module_if *, struct rtpp_acct *);
 static void rtpp_mif_do_acct_rtcp(struct rtpp_module_if *, struct rtpp_acct_rtcp *);
 static int rtpp_mif_get_mconf(struct rtpp_module_if *, struct rtpp_module_conf **);
 static int rtpp_mif_config(struct rtpp_module_if *);
-
-#define PUB2PVT(pubp) \
-  ((struct rtpp_module_if_priv *)((char *)(pubp) - offsetof(struct rtpp_module_if_priv, pub)))
 
 static const char *do_acct_aname = "do_acct";
 static const char *do_acct_rtcp_aname = "do_acct_rtcp";
@@ -102,10 +109,9 @@ static const char *do_acct_rtcp_aname = "do_acct_rtcp";
 struct rtpp_module_if *
 rtpp_module_if_ctor(const char *mpath)
 {
-    struct rtpp_refcnt *rcnt;
     struct rtpp_module_if_priv *pvt;
 
-    pvt = rtpp_rzmalloc(sizeof(struct rtpp_module_if_priv), &rcnt);
+    pvt = rtpp_rzmalloc(sizeof(struct rtpp_module_if_priv), PVT_RCOFFS(pvt));
     if (pvt == NULL) {
         goto e0;
     }
@@ -113,7 +119,6 @@ rtpp_module_if_ctor(const char *mpath)
     if (pvt->mpath == NULL) {
         goto e1;
     }
-    pvt->pub.rcnt = rcnt;
     pvt->pub.load = &rtpp_mif_load;
     pvt->pub.do_acct = &rtpp_mif_do_acct;
     pvt->pub.do_acct_rtcp = &rtpp_mif_do_acct_rtcp;
@@ -125,19 +130,42 @@ rtpp_module_if_ctor(const char *mpath)
     return ((&pvt->pub));
 
 e1:
-    CALL_SMETHOD(pvt->pub.rcnt, decref);
+    RTPP_OBJ_DECREF(&(pvt->pub));
     free(pvt);
 e0:
     return (NULL);
 }
 
 static int
-rtpp_mif_load(struct rtpp_module_if *self, struct rtpp_cfg_stable *cfsp, struct rtpp_log *log)
+packet_is_rtcp(struct po_mgr_pkt_ctx *pktx)
+{
+
+    if (pktx->strmp->pipe_type != PIPE_RTCP)
+        return (0);
+    return (1);
+}
+
+static void
+acct_rtcp_enqueue(void *arg, const struct po_mgr_pkt_ctx *pktx)
+{
+    struct rtpp_module_if_priv *pvt;
+    struct rtpp_acct_rtcp *rarp;
+
+    pvt = (struct rtpp_module_if_priv *)arg;
+    rarp = rtpp_acct_rtcp_ctor(pktx->sessp->call_id, pktx->pktp);
+    if (rarp == NULL) {
+        return;
+    }
+    rtpp_mif_do_acct_rtcp(&(pvt->pub), rarp);
+}
+
+static int
+rtpp_mif_load(struct rtpp_module_if *self, const struct rtpp_cfg *cfsp, struct rtpp_log *log)
 {
     struct rtpp_module_if_priv *pvt;
     const char *derr;
 
-    pvt = PUB2PVT(self);
+    PUB2PVT(self, pvt);
     pvt->dmp = dlopen(pvt->mpath, RTLD_NOW);
     if (pvt->dmp == NULL) {
         derr = dlerror();
@@ -174,11 +202,11 @@ rtpp_mif_load(struct rtpp_module_if *self, struct rtpp_cfg_stable *cfsp, struct 
     pvt->mip->_strdup = &rtpp_memdeb_strdup;
     pvt->mip->_asprintf = &rtpp_memdeb_asprintf;
     pvt->mip->_vasprintf = &rtpp_memdeb_vasprintf;
-    pvt->memdeb_p = rtpp_memdeb_init();
-    rtpp_memdeb_setlog(pvt->memdeb_p, log);
+    pvt->memdeb_p = rtpp_memdeb_init(false);
     if (pvt->memdeb_p == NULL) {
         goto e2;
     }
+    rtpp_memdeb_setlog(pvt->memdeb_p, log);
     rtpp_memdeb_setname(pvt->memdeb_p, pvt->mip->name);
     /* We make a copy, so that the module cannot screw us up */
     pvt->mip->memdeb_p = pvt->memdeb_p;
@@ -195,11 +223,11 @@ rtpp_mif_load(struct rtpp_module_if *self, struct rtpp_cfg_stable *cfsp, struct 
     if (pvt->sigterm == NULL) {
         goto e3;
     }
-    pvt->req_q = rtpp_queue_init(1, "rtpp_module_if(%s)", pvt->mip->name);
+    pvt->req_q = rtpp_queue_init(RTPQ_SMALL_CB_LEN, "rtpp_module_if(%s)", pvt->mip->name);
     if (pvt->req_q == NULL) {
         goto e4;
     }
-    CALL_SMETHOD(log->rcnt, incref);
+    RTPP_OBJ_INCREF(log);
     pvt->mip->log = log;
     if (pvt->mip->ctor != NULL) {
         pvt->mpvt = pvt->mip->ctor(cfsp);
@@ -228,8 +256,9 @@ e6:
         pvt->mip->dtor(pvt->mpvt);
     }
 e5:
-    CALL_SMETHOD(pvt->mip->log->rcnt, decref);
+    RTPP_OBJ_DECREF(pvt->mip->log);
     rtpp_queue_destroy(pvt->req_q);
+    pvt->req_q = NULL;
 #if RTPP_CHECK_LEAKS
     if (rtpp_memdeb_dumpstats(pvt->memdeb_p, 1) != 0) {
         RTPP_LOG(log, RTPP_LOG_ERR, "module '%s' leaked memory in the failed "
@@ -237,13 +266,15 @@ e5:
     }
 #endif
 e4:
-    rtpp_wi_free(pvt->sigterm);
+    CALL_METHOD(pvt->sigterm, dtor);
+    pvt->sigterm = NULL;
 e3:
 #if RTPP_CHECK_LEAKS
     rtpp_memdeb_dtor(pvt->memdeb_p);
 #endif
 e2:
     dlclose(pvt->dmp);
+    pvt->mip = NULL;
 e1:
     return (-1);
 }
@@ -258,30 +289,30 @@ rtpp_mif_dtor(struct rtpp_module_if_priv *pvt)
             /* First, stop the worker thread and wait for it to terminate */
             rtpp_queue_put_item(pvt->sigterm, pvt->req_q);
             pthread_join(pvt->thread_id, NULL);
-            while (rtpp_queue_get_length(pvt->req_q) > 0) {
-                rtpp_wi_free(rtpp_queue_get_item(pvt->req_q, 0));
-            }
-        } else {
-            rtpp_wi_free(pvt->sigterm);
+        } else if (pvt->sigterm != NULL) {
+            CALL_METHOD(pvt->sigterm, dtor);
         }
-        rtpp_queue_destroy(pvt->req_q);
+        if (pvt->req_q != NULL)
+            rtpp_queue_destroy(pvt->req_q);
 
-        /* Then run module destructor (if any) */
-        if (pvt->mip->dtor != NULL) {
-            pvt->mip->dtor(pvt->mpvt);
-        }
-        CALL_SMETHOD(pvt->mip->log->rcnt, decref);
+        if (pvt->mip != NULL) {
+            /* Then run module destructor (if any) */
+            if (pvt->mip->dtor != NULL) {
+                pvt->mip->dtor(pvt->mpvt);
+            }
+            RTPP_OBJ_DECREF(pvt->mip->log);
 
 #if RTPP_CHECK_LEAKS
-        /* Check if module leaked any mem */
-        if (rtpp_memdeb_dumpstats(pvt->memdeb_p, 1) != 0) {
-            RTPP_LOG(pvt->mip->log, RTPP_LOG_ERR, "module '%s' leaked memory after "
-              "destruction", pvt->mip->name);
-        }
-        rtpp_memdeb_dtor(pvt->memdeb_p);
+            /* Check if module leaked any mem */
+            if (rtpp_memdeb_dumpstats(pvt->memdeb_p, 1) != 0) {
+                RTPP_LOG(pvt->mip->log, RTPP_LOG_ERR, "module '%s' leaked memory after "
+                  "destruction", pvt->mip->name);
+            }
+            rtpp_memdeb_dtor(pvt->memdeb_p);
 #endif
-        /* Unload and free everything */
-        dlclose(pvt->dmp);
+            /* Unload and free everything */
+            dlclose(pvt->dmp);
+        }
     }
     free(pvt->mpath);
     free(pvt);
@@ -300,7 +331,7 @@ rtpp_mif_run(void *argp)
         wi = rtpp_queue_get_item(pvt->req_q, 0);
         if (rtpp_wi_get_type(wi) == RTPP_WI_TYPE_SGNL) {
             signum = rtpp_wi_sgnl_get_signum(wi);
-            rtpp_wi_free(wi);
+            CALL_METHOD(wi, dtor);
             if (signum == SIGTERM) {
                 break;
             }
@@ -313,7 +344,7 @@ rtpp_mif_run(void *argp)
             rtpp_wi_apis_getnamearg(wi, (void **)&rap, sizeof(rap));
             if (pvt->mip->on_session_end.func != NULL)
                 pvt->mip->on_session_end.func(pvt->mpvt, rap);
-            CALL_SMETHOD(rap->rcnt, decref);
+            RTPP_OBJ_DECREF(rap);
         }
         if (aname == do_acct_rtcp_aname) {
             struct rtpp_acct_rtcp *rapr;
@@ -321,9 +352,9 @@ rtpp_mif_run(void *argp)
             rtpp_wi_apis_getnamearg(wi, (void **)&rapr, sizeof(rapr));
             if (pvt->mip->on_rtcp_rcvd.func != NULL)
                 pvt->mip->on_rtcp_rcvd.func(pvt->mpvt, rapr);
-            CALL_SMETHOD(rapr->rcnt, decref);
+            RTPP_OBJ_DECREF(rapr);
         }
-        rtpp_wi_free(wi);
+        CALL_METHOD(wi, dtor);
     }
 }
 
@@ -333,14 +364,14 @@ rtpp_mif_do_acct(struct rtpp_module_if *self, struct rtpp_acct *acct)
     struct rtpp_module_if_priv *pvt;
     struct rtpp_wi *wi;
 
-    pvt = PUB2PVT(self);
+    PUB2PVT(self, pvt);
     wi = rtpp_wi_malloc_apis(do_acct_aname, &acct, sizeof(acct));
     if (wi == NULL) {
         RTPP_LOG(pvt->mip->log, RTPP_LOG_ERR, "module '%s': cannot allocate "
           "memory", pvt->mip->name);
         return;
     }
-    CALL_SMETHOD(acct->rcnt, incref);
+    RTPP_OBJ_INCREF(acct);
     rtpp_queue_put_item(wi, pvt->req_q);
 }
 
@@ -350,11 +381,12 @@ rtpp_mif_do_acct_rtcp(struct rtpp_module_if *self, struct rtpp_acct_rtcp *acct)
     struct rtpp_module_if_priv *pvt;
     struct rtpp_wi *wi;
 
-    pvt = PUB2PVT(self);
+    PUB2PVT(self, pvt);
     wi = rtpp_wi_malloc_apis(do_acct_rtcp_aname, &acct, sizeof(acct));
     if (wi == NULL) {
         RTPP_LOG(pvt->mip->log, RTPP_LOG_ERR, "module '%s': cannot allocate "
           "memory", pvt->mip->name);
+        RTPP_OBJ_DECREF(acct);
         return;
     }
     rtpp_queue_put_item(wi, pvt->req_q);
@@ -386,11 +418,20 @@ rtpp_module_vasprintf(char **pp, const char *fmt, void *p, const char *fname,
 #endif
 
 static int
-rtpp_mif_start(struct rtpp_module_if *self)
+rtpp_mif_start(struct rtpp_module_if *self, const struct rtpp_cfg *cfsp)
 {
     struct rtpp_module_if_priv *pvt;
 
-    pvt = PUB2PVT(self);
+    PUB2PVT(self, pvt);
+    if (pvt->mip->on_rtcp_rcvd.func != NULL) {
+        struct packet_observer_if acct_rtcp_poi;
+
+        acct_rtcp_poi.taste = packet_is_rtcp;
+        acct_rtcp_poi.enqueue = acct_rtcp_enqueue;
+        acct_rtcp_poi.arg = pvt;
+        if (CALL_METHOD(cfsp->observers, reg, &acct_rtcp_poi) < 0)
+            return (-1);
+    }
     if (pthread_create(&pvt->thread_id, NULL,
       (void *(*)(void *))&rtpp_mif_run, pvt) != 0) {
         return (-1);
@@ -405,7 +446,7 @@ rtpp_mif_get_mconf(struct rtpp_module_if *self, struct rtpp_module_conf **mcpp)
     struct rtpp_module_if_priv *pvt;
     struct rtpp_module_conf *rval;
 
-    pvt = PUB2PVT(self);
+    PUB2PVT(self, pvt);
     if (pvt->mip->get_mconf == NULL) {
         *mcpp = NULL;
         return (0);
@@ -423,7 +464,7 @@ rtpp_mif_config(struct rtpp_module_if *self)
 {
     struct rtpp_module_if_priv *pvt;
 
-    pvt = PUB2PVT(self);
+    PUB2PVT(self, pvt);
     if (pvt->mip->config == NULL) {
         return (0);
     }

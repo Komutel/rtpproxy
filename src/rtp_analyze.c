@@ -150,7 +150,7 @@ update_jitter_stats(struct rtp_analyze_jdata *jdp, struct rtp_info *rinfo,
               ABS(rtime_ts_delta) * 50) {
                 /* Timestamp reset */
 #if DEBUG_TIMESTAMP_RESET
-                LOGD_IF_NOT_NULL(rlog, "update_jitter_stats() : timestamp reset : " SSRC_FMT ", %ld, %ld",
+                LOGD_IF_NOT_NULL(rlog, "update_jitter_stats() : timestamp reset : " SSRC_FMT ", %lld, %lld",
                   rinfo->ssrc, ABS(rtime_ts_delta), (uint64_t)jdp->jss.prev_ts - (uint64_t)rinfo->ts);
 #endif
                 jdp->jss.ts_rcount++;
@@ -165,7 +165,7 @@ update_jitter_stats(struct rtp_analyze_jdata *jdp, struct rtp_info *rinfo,
               ABS(rtime_ts_delta) * 1024) {
                 /* Timestamp jump */
 #if DEBUG_TIMESTAMP_RESET
-                LOGD_IF_NOT_NULL(rlog,"update_jitter_stats() : timestamp jump : " SSRC_FMT ", %ld, %ld",
+                LOGD_IF_NOT_NULL(rlog,"update_jitter_stats() : timestamp jump : " SSRC_FMT ", %lld, %lld",
                   rinfo->ssrc, ABS(rtime_ts_delta), (uint64_t)rinfo->ts - (uint64_t)jdp->jss.prev_ts);
 #endif
                 jdp->jss.ts_jcount++;
@@ -178,7 +178,7 @@ update_jitter_stats(struct rtp_analyze_jdata *jdp, struct rtp_info *rinfo,
           (jdp->jss.prev_rtime_ts - (uint64_t)jdp->jss.prev_ts);
 #if DEBUG_TIMESTAMP_RESET
         if (dval > 10000)
-            LOGD_IF_NOT_NULL(rlog, "##### LARGE VALUE #####" SSRC_FMT ",%lld,%ld,%u,%ld,%u,%ld,%ld",
+            LOGD_IF_NOT_NULL(rlog, "##### LARGE VALUE #####" SSRC_FMT ",%lld,%lld,%u,%lld,%u,%lld,%lld",
               rinfo->ssrc, jdp->jss.pcount, rtime_ts, rinfo->ts, jdp->jss.prev_rtime_ts,
               jdp->jss.prev_ts, wrcorr, dval);
 #endif
@@ -188,7 +188,7 @@ update_jitter_stats(struct rtp_analyze_jdata *jdp, struct rtp_info *rinfo,
         }
         jdp->jss.jtotal += jdp->jss.jlast;
     }
-#if RTPP_DEBUG_analyze
+#if RTPP_DEBUG_analyze > 1
     LOGD_IF_NOT_NULL(rlog, SSRC_FMT ",%lld,%llu,%u,%f", rinfo->ssrc, jdp->jss.pcount,
       rtime_ts, rinfo->ts, jdp->jss.jlast);
 #endif
@@ -276,7 +276,7 @@ rtp_analyze_jt_destroy(struct rtp_analyze_jitter *jp)
 
     for (jdp = jp->first; jdp != NULL; jdp = jdp_next) {
         jdp_next = jdp->next;
-        CALL_SMETHOD(jdp->ts_dedup->rcnt, decref);
+        RTPP_OBJ_DECREF(jdp->ts_dedup);
         free(jdp);
         jp->jdlen -= 1;
     }
@@ -351,6 +351,8 @@ update_rtpp_stats(struct rtpp_log *rlog, struct rtpp_session_stat *stat, rtp_hdr
 
     rpp = rinfo->rtp_profile;
     jdp = jdata_by_ssrc(stat->jdata, rinfo->ssrc);
+    if (jdp == NULL)
+        return (UPDATE_ERR);
     if (stat->ssrc_changes == 0) {
         RTPP_DBG_ASSERT(stat->last.pcount == 0);
         RTPP_DBG_ASSERT(stat->psent == 0);
@@ -365,7 +367,7 @@ update_rtpp_stats(struct rtpp_log *rlog, struct rtpp_session_stat *stat, rtp_hdr
         idx = (rinfo->seq % 131072) >> 5;
         stat->last.seen[idx] |= 1 << (rinfo->seq & 31);
         stat->last.seq = rinfo->seq;
-        if (rpp->ts_rate > 0 && jdp != NULL) {
+        if (rpp->ts_rate > 0) {
             update_jitter_stats(jdp, rinfo, rtime, RTP_NORMAL, rlog);
         }
         return (UPDATE_OK);
@@ -391,7 +393,7 @@ update_rtpp_stats(struct rtpp_log *rlog, struct rtpp_session_stat *stat, rtp_hdr
         idx = (rinfo->seq % 131072) >> 5;
         stat->last.seen[idx] |= 1 << (rinfo->seq & 31);
         stat->last.seq = rinfo->seq;
-        if (rpp->ts_rate > 0 && jdp != NULL) {
+        if (rpp->ts_rate > 0) {
             update_jitter_stats(jdp, rinfo, rtime, RTP_SSRC_RESET, rlog);
         }
         return (UPDATE_SSRC_CHG);
@@ -412,12 +414,12 @@ update_rtpp_stats(struct rtpp_log *rlog, struct rtpp_session_stat *stat, rtp_hdr
         idx = (seq % 131072) >> 5;
         stat->last.seen[idx] |= 1 << (rinfo->seq & 31);
         stat->last.seq = rinfo->seq;
-        if (rpp->ts_rate > 0 && jdp != NULL) {
+        if (rpp->ts_rate > 0) {
             update_jitter_stats(jdp, rinfo, rtime, RTP_SEQ_RESET, rlog);
         }
         return (UPDATE_OK);
     } else {
-        if (rpp->ts_rate > 0 && jdp != NULL) {
+        if (rpp->ts_rate > 0) {
             if (seq == 0 && (stat->last.max_seq & 0xffff) < 65500) {
                 update_jitter_stats(jdp, rinfo, rtime, RTP_SEQ_RESET, rlog);
             } else {

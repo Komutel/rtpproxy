@@ -31,30 +31,31 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <netinet/in.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
 
-#include "config.h"
+#include "config_pp.h"
 
 #include "rtpp_types.h"
 #include "rtpp_defines.h"
 #include "rtpp_list.h"
 #include "rtpp_log.h"
 #include "rtpp_log_obj.h"
-#include "rtpp_cfg_stable.h"
+#include "rtpp_cfg.h"
+#include "rtpp_command.h"
 #include "rtpp_controlfd.h"
 #include "rtpp_mallocs.h"
 #include "rtpp_network.h"
-
-#include "config_pp.h"
+#include "rtpp_runcreds.h"
+#include "rtpp_util.h"
 
 #if !defined(NO_ERR_H)
 #include <err.h>
 #endif
-#include "rtpp_util.h"
 
 #ifdef HAVE_SYSTEMD_DAEMON
 #include <systemd/sd-daemon.h>
@@ -68,24 +69,30 @@ controlfd_init_systemd(void)
 
     nfd = sd_listen_fds(0);
     if (nfd > 1) {
-        errx(1, "Too many file descriptors received.");
+        warnx("Too many file descriptors received.");
+        return (-1);
     }
     if (nfd == 1) {
         return (SD_LISTEN_FDS_START + 0);
     }
 #else
-    errx(1, "systemd is not supported or not detected on your system, "
+    warnx("systemd is not supported or not detected on your system, "
       "please consider filing report or submitting a patch");
 #endif
     return (-1);
 }
 
 static int
-controlfd_init_ifsun(struct cfg *cf, struct rtpp_ctrl_sock *csp)
+controlfd_init_ifsun(const struct rtpp_cfg *cfsp, struct rtpp_ctrl_sock *csp)
 {
     int controlfd, reuse;
     struct sockaddr_un *ifsun;
 
+    if (strlen(csp->cmd_sock) >= sizeof(ifsun->sun_path)) {
+        warnx("socket name is too long: %s", csp->cmd_sock);
+        errno = ENAMETOOLONG;
+        return (-1);
+    }
     unlink(csp->cmd_sock);
     ifsun = sstosun(&csp->bindaddr);
     memset(ifsun, '\0', sizeof(struct sockaddr_un));
@@ -93,28 +100,41 @@ controlfd_init_ifsun(struct cfg *cf, struct rtpp_ctrl_sock *csp)
     ifsun->sun_len = strlen(csp->cmd_sock);
 #endif
     ifsun->sun_family = AF_LOCAL;
-    strcpy(ifsun->sun_path, csp->cmd_sock);
+    strlcpy(ifsun->sun_path, csp->cmd_sock, sizeof(ifsun->sun_path));
     controlfd = socket(AF_LOCAL, SOCK_STREAM, 0);
-    if (controlfd == -1)
-        err(1, "can't create socket");
+    if (controlfd == -1) {
+        warn("can't create socket");
+        return (-1);
+    }
     reuse = 1;
     setsockopt(controlfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-    if (bind(controlfd, sstosa(ifsun), sizeof(struct sockaddr_un)) < 0)
-        err(1, "can't bind to a socket: %s", csp->cmd_sock);
-    if ((cf->stable->run_uname != NULL || cf->stable->run_gname != NULL) &&
-      chown(csp->cmd_sock, cf->stable->run_uid, cf->stable->run_gid) == -1)
-        err(1, "can't set owner of the socket: %s", csp->cmd_sock);
-    if ((cf->stable->run_gname != NULL) && cf->stable->sock_mode != 0 &&
-      (chmod(csp->cmd_sock, cf->stable->sock_mode) == -1))
-        err(1, "can't allow rw acces to group");
-    if (listen(controlfd, 32) != 0)
-        err(1, "can't listen on a socket: %s", csp->cmd_sock);
+    if (bind(controlfd, sstosa(ifsun), sizeof(struct sockaddr_un)) < 0) {
+        warn("can't bind to a socket: %s", csp->cmd_sock);
+        goto e0;
+    }
+    if ((cfsp->runcreds->uname != NULL || cfsp->runcreds->gname != NULL) &&
+      chown(csp->cmd_sock, cfsp->runcreds->uid, cfsp->runcreds->gid) == -1) {
+        warn("can't set owner of the socket: %s", csp->cmd_sock);
+        goto e0;
+    }
+    if ((cfsp->runcreds->gname != NULL) && cfsp->runcreds->sock_mode != 0 &&
+      (chmod(csp->cmd_sock, cfsp->runcreds->sock_mode) == -1)) {
+        warn("can't allow rw acces to group");
+        goto e0;
+    }
+    if (listen(controlfd, 32) != 0) {
+        warn("can't listen on a socket: %s", csp->cmd_sock);
+        goto e0;
+    }
 
     return (controlfd);
+e0:
+    close(controlfd);
+    return (-1);
 }
 
 static int
-controlfd_init_udp(struct cfg *cf, struct rtpp_ctrl_sock *csp)
+controlfd_init_udp(const struct rtpp_cfg *cfsp, struct rtpp_ctrl_sock *csp)
 {
     struct sockaddr *ifsin;
     char *cp;
@@ -130,22 +150,29 @@ controlfd_init_udp(struct cfg *cf, struct rtpp_ctrl_sock *csp)
     csp->port_ctl = atoi(cp);
     i = (csp->type == RTPC_UDP6) ? AF_INET6 : AF_INET;
     ifsin = sstosa(&csp->bindaddr);
-    if (setbindhost(ifsin, i, csp->cmd_sock, cp) != 0)
-        exit(1);
+    if (setbindhost(ifsin, i, csp->cmd_sock, cp) != 0) {
+        warnx("setbindhost failed");
+        return (-1);
+    }
     controlfd = socket(i, SOCK_DGRAM, 0);
-    if (controlfd == -1)
-        err(1, "can't create socket");
+    if (controlfd == -1) {
+        warn("can't create socket");
+        return (-1);
+    }
     so_rcvbuf = 16 * 1024;
     if (setsockopt(controlfd, SOL_SOCKET, SO_RCVBUF, &so_rcvbuf, sizeof(so_rcvbuf)) == -1)
-        RTPP_ELOG(cf->stable->glog, RTPP_LOG_ERR, "unable to set 16K receive buffer size on controlfd");
-    if (bind(controlfd, ifsin, SA_LEN(ifsin)) < 0)
-        err(1, "can't bind to a socket");
+        RTPP_ELOG(cfsp->glog, RTPP_LOG_ERR, "unable to set 16K receive buffer size on controlfd");
+    if (bind(controlfd, ifsin, SA_LEN(ifsin)) < 0) {
+        warn("can't bind to a socket");
+        close(controlfd);
+        return (-1);
+    }
 
     return (controlfd);
 }
 
 static int
-controlfd_init_tcp(struct cfg *cf, struct rtpp_ctrl_sock *csp)
+controlfd_init_tcp(const struct rtpp_cfg *cfsp, struct rtpp_ctrl_sock *csp)
 {
     struct sockaddr *ifsin;
     char *cp;
@@ -161,29 +188,40 @@ controlfd_init_tcp(struct cfg *cf, struct rtpp_ctrl_sock *csp)
     csp->port_ctl = atoi(cp);
     i = (csp->type == RTPC_TCP6) ? AF_INET6 : AF_INET;
     ifsin = sstosa(&csp->bindaddr);
-    if (setbindhost(ifsin, i, csp->cmd_sock, cp) != 0)
-        exit(1);
+    if (setbindhost(ifsin, i, csp->cmd_sock, cp) != 0) {
+        warnx("setbindhost failed");
+        return (-1);
+    }
     controlfd = socket(i, SOCK_STREAM, 0);
-    if (controlfd == -1)
-        err(1, "can't create socket");
+    if (controlfd == -1) {
+        warn("can't create socket");
+        return (-1);
+    }
     so_rcvbuf = 16 * 1024;
     if (setsockopt(controlfd, SOL_SOCKET, SO_RCVBUF, &so_rcvbuf, sizeof(so_rcvbuf)) == -1)
-        RTPP_ELOG(cf->stable->glog, RTPP_LOG_ERR, "unable to set 16K receive buffer size on controlfd");
-    if (bind(controlfd, ifsin, SA_LEN(ifsin)) < 0)
-        err(1, "can't bind to a socket");
-    if (listen(controlfd, 32) != 0)
-        err(1, "can't listen on a socket: %s", csp->cmd_sock);
+        RTPP_ELOG(cfsp->glog, RTPP_LOG_ERR, "unable to set 16K receive buffer size on controlfd");
+    if (bind(controlfd, ifsin, SA_LEN(ifsin)) < 0) {
+        warn("can't bind to a socket");
+        goto e0;
+    }
+    if (listen(controlfd, 32) != 0) {
+        warn("can't listen on a socket: %s", csp->cmd_sock);
+        goto e0;
+    }
 
     return (controlfd);
+e0:
+    close(controlfd);
+    return (-1);
 }
 
 int
-rtpp_controlfd_init(struct cfg *cf)
+rtpp_controlfd_init(const struct rtpp_cfg *cfsp)
 {
     int controlfd_in, controlfd_out, flags;
     struct rtpp_ctrl_sock *ctrl_sock;
 
-    for (ctrl_sock = RTPP_LIST_HEAD(cf->stable->ctrl_socks);
+    for (ctrl_sock = RTPP_LIST_HEAD(cfsp->ctrl_socks);
       ctrl_sock != NULL; ctrl_sock = RTPP_ITER_NEXT(ctrl_sock)) {
         switch (ctrl_sock->type) {
         case RTPC_SYSD:
@@ -192,17 +230,17 @@ rtpp_controlfd_init(struct cfg *cf)
 
         case RTPC_IFSUN:
         case RTPC_IFSUN_C:
-            controlfd_in = controlfd_out = controlfd_init_ifsun(cf, ctrl_sock);
+            controlfd_in = controlfd_out = controlfd_init_ifsun(cfsp, ctrl_sock);
             break;
 
         case RTPC_UDP4:
         case RTPC_UDP6:
-            controlfd_in = controlfd_out = controlfd_init_udp(cf, ctrl_sock);
+            controlfd_in = controlfd_out = controlfd_init_udp(cfsp, ctrl_sock);
             break;
 
         case RTPC_TCP4:
         case RTPC_TCP6:
-            controlfd_in = controlfd_out = controlfd_init_tcp(cf, ctrl_sock);
+            controlfd_in = controlfd_out = controlfd_init_tcp(cfsp, ctrl_sock);
             break;
 
         case RTPC_STDIO:
@@ -213,16 +251,19 @@ rtpp_controlfd_init(struct cfg *cf)
         if (controlfd_in < 0 || controlfd_out < 0) {
             return (-1);
         }
-        flags = fcntl(controlfd_in, F_GETFL);
-        fcntl(controlfd_in, F_SETFL, flags | O_NONBLOCK);
         ctrl_sock->controlfd_in = controlfd_in;
         ctrl_sock->controlfd_out = controlfd_out;
+        flags = fcntl(controlfd_in, F_GETFL);
+        if (flags < 0 || fcntl(controlfd_in, F_SETFL, flags | O_NONBLOCK) < 0) {
+            warn("can't set O_NONBLOCK on a socket: %d", controlfd_in);
+            return (-1);
+        }
     }
 
     return (0);
 }
 
-int
+socklen_t
 rtpp_csock_addrlen(struct rtpp_ctrl_sock *ctrl_sock)
 {
 
@@ -238,20 +279,23 @@ rtpp_csock_addrlen(struct rtpp_ctrl_sock *ctrl_sock)
     case RTPC_UDP6:
     case RTPC_TCP6:
         return (sizeof(struct sockaddr_in6));
-
+            
+    case RTPC_SYSD:
+        return (sizeof(struct sockaddr_un));
+            
     default:
         break;
     }
 
-    return (-1);
+    return (0);
 }
 
 void
-rtpp_controlfd_cleanup(struct cfg *cf)
+rtpp_controlfd_cleanup(const struct rtpp_cfg *cfsp)
 {
     struct rtpp_ctrl_sock *ctrl_sock;
 
-    for (ctrl_sock = RTPP_LIST_HEAD(cf->stable->ctrl_socks);
+    for (ctrl_sock = RTPP_LIST_HEAD(cfsp->ctrl_socks);
       ctrl_sock != NULL; ctrl_sock = RTPP_ITER_NEXT(ctrl_sock)) {
         if (RTPP_CTRL_ISUNIX(ctrl_sock) == 0)
             continue;
@@ -303,6 +347,7 @@ rtpp_ctrl_sock_parse(const char *optarg)
     return (rcsp);
 }
 
+#if 0
 const char *
 rtpp_ctrl_sock_describe(struct rtpp_ctrl_sock *rcsp)
 {
@@ -336,3 +381,4 @@ rtpp_ctrl_sock_describe(struct rtpp_ctrl_sock *rcsp)
         abort();
     }
 }
+#endif

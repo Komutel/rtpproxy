@@ -32,6 +32,7 @@
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <dlfcn.h>
+#include <stdint.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -63,6 +64,18 @@ get_d10(int val)
     return (c);
 }
 
+static const void *topframe;
+
+const void *
+execinfo_set_topframe(const void *tfp)
+{
+    const void *otfp;
+
+    otfp = topframe;
+    topframe = tfp;
+    return (otfp);
+}
+
 int
 backtrace(void **buffer, int size)
 {
@@ -70,13 +83,50 @@ backtrace(void **buffer, int size)
 
     if (size > STACKTRAVERSE_MAX_LEVELS)
         size = STACKTRAVERSE_MAX_LEVELS;
-    for (i = 1; getframeaddr(i + 1) != NULL && i != size + 1; i++) {
+    for (i = 1; i < size + 1 && getframeaddr(i) != NULL; i++) {
         buffer[i - 1] = getreturnaddr(i);
         if (buffer[i - 1] == NULL)
             break;
+	if (buffer[i - 1] == topframe)
+	    return i;
     }
 
     return i - 1;
+}
+
+const static unsigned int sc_randtable[STACKTRAVERSE_MAX_LEVELS + 1] = {
+    23,  3, 50, 54,  6, 63, 58, 61, 12,  4, 46, 36, 52, 35, 28, 55, 11, 29, 60,
+    38, 37, 53,  7, 26,  2, 39,  0, 30, 14, 56, 48, 27, 33, 47, 24, 57, 20, 34,
+    31, 15, 51, 13, 32,  8,  1, 49, 22, 21, 45, 41, 62, 40, 19, 44, 17, 10, 59,
+    18,  5, 16,  9, 25, 43, 42, 55, 14, 46,  6, 20, 29, 48, 12, 63, 31, 60, 34,
+    61, 32, 37, 36, 22, 45, 58,  8, 54, 24, 44, 49, 41, 11,  5, 15,  1, 56,  4,
+    21, 10,  3,  9,  2, 13, 47, 50, 57, 51, 26, 17, 35, 18,  0, 53, 59, 43, 52,
+    30, 27, 19, 38, 42, 23, 25, 40,  7, 62, 33, 28, 39, 16
+};
+
+static uintptr_t
+ROR(uintptr_t x, unsigned int sft)
+{
+
+    return ((x >> sft) | (x << ((sizeof(x) * 8) - sft)));
+}
+
+uintptr_t
+getstackcookie(void)
+{
+    int i;
+    uintptr_t r, tr;
+    void *p;
+
+    r = 0;
+    for (i = 1; i < STACKTRAVERSE_MAX_LEVELS + 1 && getframeaddr(i) != NULL; i++) {
+        p = getreturnaddr(i);
+        tr = ROR((uintptr_t)p, sc_randtable[i - 1]);
+        r ^= tr;
+        if (p == topframe || p == NULL)
+            break;
+    }
+    return (r);
 }
 
 char **
@@ -97,23 +147,25 @@ backtrace_symbols(void *const *buffer, int size)
             if (info.dli_saddr == NULL)
                 info.dli_saddr = buffer[i];
             offset = (char *)buffer[i] - (char *)info.dli_saddr;
-            /* "0x01234567 <function+offset> at filename" */
-            alen = 2 +                      /* "0x" */
+            /* "#0      0x01234567 in <function+offset> at filename" */
+            alen = 1 + get_d10(i) + 1 +     /* "#0\t" */
+                   2 +                      /* "0x" */
                    (sizeof(void *) * 2) +   /* "01234567" */
-                   2 +                      /* " <" */
+                   5 +                      /* " in <" */
                    strlen(info.dli_sname) + /* "function" */
                    1 +                      /* "+" */
                    get_d10(offset) +        /* "offset" */
                    5 +                      /* "> at " */
                    strlen(info.dli_fname) + /* "filename" */
                    1;                       /* "\0" */
-            snprintf(bp, bsize, "%p <%s+%d> at %s",
+            snprintf(bp, bsize, "#%d\t%p in <%s+%d> at %s", i,
               buffer[i], info.dli_sname, offset, info.dli_fname);
         } else {
-            alen = 2 +                      /* "0x" */
+            alen = 1 + get_d10(i) + 1 +     /* "#0\t" */
+                   2 +                      /* "0x" */
                    (sizeof(void *) * 2) +   /* "01234567" */
                    1;                       /* "\0" */
-            snprintf(bp, bsize, "%p", buffer[i]);
+            snprintf(bp, bsize, "#%d\t%p", i, buffer[i]);
         }
         bt_rvals[i] = bp;
         bp += alen;
@@ -145,10 +197,11 @@ backtrace_symbols_fd(void *const *buffer, int size, int fd)
             if (info.dli_saddr == NULL)
                 info.dli_saddr = buffer[i];
             offset = (char *)buffer[i] - (char *)info.dli_saddr;
-            /* "0x01234567 <function+offset> at filename" */
-            len = 2 +                      /* "0x" */
+            /* "#0      0x01234567 in <function+offset> at filename" */
+            len = 1 + get_d10(i) + 1 +     /* "#0\t" */
+                  2 +                      /* "0x" */
                   (sizeof(void *) * 2) +   /* "01234567" */
-                  2 +                      /* " <" */
+                  5 +                      /* " in <" */
                   strlen(info.dli_sname) + /* "function" */
                   1 +                      /* "+" */
                   get_d10(offset) +        /* "offset" */
@@ -158,17 +211,34 @@ backtrace_symbols_fd(void *const *buffer, int size, int fd)
             buf = alloca(len);
             if (buf == NULL)
                 return;
-            snprintf(buf, len, "%p <%s+%d> at %s\n",
+            snprintf(buf, len, "#%d\t%p in <%s+%d> at %s\n", i,
               buffer[i], info.dli_sname, offset, info.dli_fname);
         } else {
-            len = 2 +                      /* "0x" */
+            len = 1 + get_d10(i) + 1 +     /* "#0 " */
+                  2 +                      /* "0x" */
                   (sizeof(void *) * 2) +   /* "01234567" */
                   2;                       /* "\n\0" */
             buf = alloca(len);
             if (buf == NULL)
                 return;
-            snprintf(buf, len, "%p\n", buffer[i]);
+            snprintf(buf, len, "#%d\t%p\n", i, buffer[i]);
         }
         write(fd, buf, strlen(buf));
     }
 }
+
+#if defined(execinfo_TEST)
+#include <assert.h>
+#include <stdio.h>
+
+int
+execinfo_TEST(void)
+{
+  void *faketrace[] = {(void *)0xdeadbeef, (void *)0xbadc00de, execinfo_TEST, NULL};
+
+  assert(get_d10(-1) == 2);
+  assert(get_d10(-100) == 4);
+  backtrace_symbols_fd(faketrace, 4, fileno(stdout));
+  assert(backtrace_symbols(faketrace, 4) != NULL);
+}
+#endif

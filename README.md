@@ -1,10 +1,12 @@
 [![Build Status](https://travis-ci.org/sippy/rtpproxy.svg?branch=master)](https://travis-ci.org/sippy/rtpproxy)
+[![Coverage Status](https://coveralls.io/repos/github/sippy/rtpproxy/badge.svg?branch=master)](https://coveralls.io/github/sippy/rtpproxy?branch=master)
+[![Coverity](https://scan.coverity.com/projects/8841/badge.svg)](https://scan.coverity.com/projects/sippy-rtpproxy)
 
 ## About
 
 The RTPproxy is a high-performance software proxy for RTP streams that can
-work together with OpenSIPS, Kamailio or [Sippy B2BUA]
-(https://github.com/sippy/b2bua).
+work together with [OpenSIPS](https://opensips.org), [Kamailio](https://kamailio.org)
+or [Sippy B2BUA](https://github.com/sippy/b2bua).
 
 Originally created for handling NAT scenarios it can also act as a generic
 media relay as well as gateway RTP sessions between IPv4 and IPv6 networks.
@@ -68,6 +70,8 @@ $ cd rtpproxy
 $ ./configure
 $ make
 ```
+
+For detailed compilation instructions please check [User Manual](https://www.rtpproxy.org/doc/master/user_manual.html#MAKESRC).
 
 ## Support
 

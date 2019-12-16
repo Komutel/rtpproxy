@@ -2,6 +2,10 @@
 
 #include "stacktraverse.h"
 
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic ignored "-Wframe-address"
+#endif
+
 void *
 getreturnaddr(int level)
 {
@@ -138,10 +142,6 @@ getreturnaddr(int level)
     default: return NULL;
     }
 }
-
-#include <stddef.h>
-
-#include "stacktraverse.h"
 
 void *
 getframeaddr(int level)

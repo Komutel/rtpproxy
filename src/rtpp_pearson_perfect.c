@@ -54,9 +54,6 @@ static const struct rtpp_pearson_perfect_smethods rtpp_pearson_perfect_smethods 
     .hash = &rtpp_pearson_perfect_hash
 };
 
-#define PUB2PVT(pubp) \
-  ((struct rtpp_pearson_perfect_priv *)((char *)(pubp) - offsetof(struct rtpp_pearson_perfect_priv, pub)))
-
 static void
 compute_perfect_hash(struct rtpp_pearson_perfect_priv *rppp)
 {
@@ -83,16 +80,14 @@ rtpp_pearson_perfect_ctor(rtpp_pearson_getval_t gv, void *gv_arg)
 {
     struct rtpp_pearson_perfect_priv *rppp;
     struct rtpp_pearson_perfect *pub;
-    struct rtpp_refcnt *rcnt;
 
-    rppp = rtpp_rzmalloc(sizeof(struct rtpp_pearson_perfect_priv), &rcnt);
+    rppp = rtpp_rzmalloc(sizeof(struct rtpp_pearson_perfect_priv), PVT_RCOFFS(rppp));
     if (rppp == NULL) {
         return (NULL);
     }
     rppp->gv = gv;
     rppp->gv_arg = gv_arg;
     pub = &rppp->pub;
-    pub->rcnt = rcnt;
 
     compute_perfect_hash(rppp);
     pub->smethods = &rtpp_pearson_perfect_smethods;
@@ -108,7 +103,7 @@ rtpp_pearson_perfect_hash(struct rtpp_pearson_perfect *self, const char *isval)
     const char *sval;
     struct rtpp_pearson_perfect_priv *rppp;
 
-    rppp = PUB2PVT(self);
+    PUB2PVT(self, rppp);
     rval = rppp->omap_table[rtpp_pearson_hash8(&rppp->rp, isval, NULL)] - 1;
     if (rval == -1) {
         return (-1);

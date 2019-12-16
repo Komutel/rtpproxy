@@ -40,26 +40,24 @@
 #include "config.h"
 
 #include "rtpp_log.h"
-#include "rtpp_cfg_stable.h"
-#include "rtpp_defines.h"
+#include "rtpp_cfg.h"
 #include "rtpp_types.h"
 #include "rtpp_refcnt.h"
 #include "rtpp_log_obj.h"
+#include "rtpp_time.h"
 #include "rtpp_command.h"
 #include "rtpp_command_async.h"
 #include "rtpp_command_private.h"
 #include "rtpp_command_rcache.h"
 #include "rtpp_command_stream.h"
-#if 0
-#include "rtpp_math.h"
-#endif
 #include "rtpp_network.h"
 #include "rtpp_netio_async.h"
 #include "rtpp_mallocs.h"
 #include "rtpp_stats.h"
 #include "rtpp_list.h"
 #include "rtpp_controlfd.h"
-#include "rtpp_time.h"
+#include "rtpp_locking.h"
+#include "rtpp_proc_async.h"
 
 #define RTPC_MAX_CONNECTIONS 100
 
@@ -94,11 +92,9 @@ struct rtpp_cmd_async_cf {
     struct rtpp_command_stats cstats;
     struct rtpp_cmd_pollset pset;
     struct rtpp_cmd_accptset aset;
-    struct cfg *cf_save;
+    struct rtpp_cfg *cf_save;
     struct rtpp_cmd_rcache *rcache;
 };
-
-#define PUB2PVT(pubp)	((struct rtpp_cmd_async_cf *)((char *)(pubp) - offsetof(struct rtpp_cmd_async_cf, pub)))
 
 #define TSTATE_RUN   0x0
 #define TSTATE_CEASE 0x1
@@ -151,7 +147,8 @@ flush_cstats(struct rtpp_stats *sobj, struct rtpp_command_stats *csp)
 }
 
 static int
-accept_connection(struct cfg *cf, struct rtpp_ctrl_sock *rcsp, struct sockaddr *rap)
+accept_connection(const struct rtpp_cfg *cfsp, struct rtpp_ctrl_sock *rcsp,
+  struct sockaddr *rap)
 {
     int controlfd;
     socklen_t rlen;
@@ -161,7 +158,7 @@ accept_connection(struct cfg *cf, struct rtpp_ctrl_sock *rcsp, struct sockaddr *
     controlfd = accept(rcsp->controlfd_in, rap, &rlen);
     if (controlfd == -1) {
         if (errno != EWOULDBLOCK) {
-            RTPP_ELOG(cf->stable->glog, RTPP_LOG_ERR,
+            RTPP_ELOG(cfsp->glog, RTPP_LOG_ERR,
               "can't accept connection on control socket");
         }
         return (-1);
@@ -170,9 +167,9 @@ accept_connection(struct cfg *cf, struct rtpp_ctrl_sock *rcsp, struct sockaddr *
 }
 
 static int
-process_commands(struct rtpp_ctrl_sock *csock, struct cfg *cf, int controlfd, double dtime,
-  struct rtpp_command_stats *csp, struct rtpp_stats *rsc,
-  struct rtpp_cmd_rcache *rcp)
+process_commands(struct rtpp_ctrl_sock *csock, const struct rtpp_cfg *cfsp, int controlfd,
+  const struct rtpp_timestamp *dtime, struct rtpp_command_stats *csp,
+  struct rtpp_stats *rsc, struct rtpp_cmd_rcache *rcp)
 {
     int i, rval;
     struct rtpp_command *cmd;
@@ -181,18 +178,20 @@ process_commands(struct rtpp_ctrl_sock *csock, struct cfg *cf, int controlfd, do
     umode = RTPP_CTRL_ISDG(csock);
     i = 0;
     do {
-        cmd = get_command(cf, controlfd, &rval, dtime, csp, umode, rcp);
+again:
+        cmd = get_command(cfsp, csock, controlfd, &rval, dtime, csp, rcp);
         if (cmd == NULL) {
-            if (rval == GET_CMD_OK) {
+            switch (rval) {
+            case GET_CMD_OK:
+            case GET_CMD_ENOMEM:
                 /*
                  * get_command() failed with error other than I/O error
                  * or something, there might be some good commands in
                  * the queue.
                  */
-                continue;
-            }
-            if (rval == GET_CMD_EOF) {
-                break;
+                goto again;
+            case GET_CMD_EOF:
+                goto out;
             }
             i = -1;
         } else {
@@ -201,50 +200,55 @@ process_commands(struct rtpp_ctrl_sock *csock, struct cfg *cf, int controlfd, do
                 flush_cstats(rsc, csp);
             }
             if (cmd->no_glock == 0) {
-                pthread_mutex_lock(&cf->glock);
+                pthread_mutex_lock(&(cfsp->locks->glob));
             }
-            i = handle_command(cf, cmd);
+            i = handle_command(cfsp, cmd);
             if (cmd->no_glock == 0) {
-                pthread_mutex_unlock(&cf->glock);
+                pthread_mutex_unlock(&(cfsp->locks->glob));
             }
             free_command(cmd);
         }
     } while (i == 0 && umode != 0);
+out:
     return (i);
 }
 
 static int
-process_commands_stream(struct cfg *cf, struct rtpp_cmd_connection *rcc,
-  double dtime, struct rtpp_command_stats *csp, struct rtpp_stats *rsc)
+process_commands_stream(const struct rtpp_cfg *cfsp, struct rtpp_cmd_connection *rcc,
+  const struct rtpp_timestamp *dtime, struct rtpp_command_stats *csp, struct rtpp_stats *rsc)
 {
     int rval;
     struct rtpp_command *cmd;
 
-    rval = rtpp_command_stream_doio(cf, rcc);
+    rval = rtpp_command_stream_doio(cfsp, rcc);
     if (rval <= 0) {
         return (-1);
     }
     do {
-        cmd = rtpp_command_stream_get(cf, rcc, &rval, dtime, csp);
+again:
+        cmd = rtpp_command_stream_get(cfsp, rcc, &rval, dtime, csp);
         if (cmd == NULL) {
-            if (rval == GET_CMD_EAGAIN) {
+            switch (rval) {
+            case GET_CMD_EAGAIN:
                 return (0);
-            }
-            if (rval != GET_CMD_OK) {
+            case GET_CMD_OK:
+            case GET_CMD_INVAL:
+            case GET_CMD_ENOMEM:
+                goto again;
+            default:
                 return (-1);
             }
-            continue;
         }
         cmd->laddr = sstosa(&rcc->csock->bindaddr);
         if (cmd->cca.op == GET_STATS || cmd->cca.op == INFO) {
             flush_cstats(rsc, csp);
         }
         if (cmd->no_glock == 0) {
-            pthread_mutex_lock(&cf->glock);
+            pthread_mutex_lock(&(cfsp->locks->glob));
         }
-        rval = handle_command(cf, cmd);
+        rval = handle_command(cfsp, cmd);
         if (cmd->no_glock == 0) {
-            pthread_mutex_unlock(&cf->glock);
+            pthread_mutex_unlock(&(cfsp->locks->glob));
         }
         free_command(cmd);
     } while (rval == 0);
@@ -322,7 +326,7 @@ rtpp_cmd_acceptor_run(void *arg)
                 pthread_mutex_unlock(&psp->pfds_mutex);
                 continue;
             }
-            controlfd = accept_connection(cmd_cf->cf_save, asp->csocks[i],
+            controlfd = accept_connection(CONST(cmd_cf->cf_save), asp->csocks[i],
               sstosa(&raddr));
             if (controlfd < 0) {
                 pthread_mutex_unlock(&psp->pfds_mutex);
@@ -378,7 +382,7 @@ rtpp_cmd_queue_run(void *arg)
     struct rtpp_cmd_async_cf *cmd_cf;
     struct rtpp_cmd_pollset *psp;
     int i, nready, rval;
-    double sptime;
+    struct rtpp_timestamp sptime;
 #if 0
     double eptime, tused;
 #endif
@@ -386,13 +390,13 @@ rtpp_cmd_queue_run(void *arg)
     struct rtpp_stats *rtpp_stats_cf;
 
     cmd_cf = (struct rtpp_cmd_async_cf *)arg;
-    rtpp_stats_cf = cmd_cf->cf_save->stable->rtpp_stats;
+    rtpp_stats_cf = cmd_cf->cf_save->rtpp_stats;
     csp = &cmd_cf->cstats;
 
     psp = &cmd_cf->pset;
 
     for (;;) {
-        sptime = getdtime();
+        rtpp_timestamp_get(&sptime);
 
         pthread_mutex_lock(&psp->pfds_mutex);
         if (psp->pfds_used == 0) {
@@ -429,10 +433,10 @@ again:
                     continue;
                 }
                 if (RTPP_CTRL_ISSTREAM(psp->rccs[i]->csock)) {
-                    rval = process_commands_stream(cmd_cf->cf_save, psp->rccs[i], sptime, csp, rtpp_stats_cf);
+                    rval = process_commands_stream(CONST(cmd_cf->cf_save), psp->rccs[i], &sptime, csp, rtpp_stats_cf);
                 } else {
-                    rval = process_commands(psp->rccs[i]->csock, cmd_cf->cf_save, psp->pfds[i].fd,
-                      sptime, csp, rtpp_stats_cf, cmd_cf->rcache);
+                    rval = process_commands(psp->rccs[i]->csock, CONST(cmd_cf->cf_save), psp->pfds[i].fd,
+                      &sptime, csp, rtpp_stats_cf, cmd_cf->rcache);
                 }
                 /*
                  * Shut down non-datagram sockets that got I/O error
@@ -442,7 +446,7 @@ again:
                 if (!RTPP_CTRL_ISDG(psp->rccs[i]->csock) && (rval == -1 || !RTPP_CTRL_ISSTREAM(psp->rccs[i]->csock))) {
 closefd:
                     if (psp->rccs[i]->csock->type == RTPC_STDIO && psp->rccs[i]->csock->exit_on_close != 0) {
-                        cmd_cf->cf_save->stable->slowshutdown = 1;
+                        cmd_cf->cf_save->slowshutdown = 1;
                     }
                     rtpp_cmd_connection_dtor(psp->rccs[i]);
                     psp->pfds_used--;
@@ -458,23 +462,23 @@ closefd:
         }
         pthread_mutex_unlock(&psp->pfds_mutex);
         if (nready > 0) {
-            rtpp_anetio_pump(cmd_cf->cf_save->stable->rtpp_netio_cf);
+            rtpp_anetio_pump(cmd_cf->cf_save->rtpp_proc_cf->netio);
         }
 #if 0
         eptime = getdtime();
         pthread_mutex_lock(&cmd_cf->cmd_mutex);
-        recfilter_apply(&cmd_cf->average_load, (eptime - sptime + tused) * cmd_cf->cf_save->stable->target_pfreq);
+        recfilter_apply(&cmd_cf->average_load, (eptime - sptime.mono + tused) * cmd_cf->cf_save->target_pfreq);
         pthread_mutex_unlock(&cmd_cf->cmd_mutex);
 #endif
         flush_cstats(rtpp_stats_cf, csp);
 #if 0
 #if RTPP_DEBUG
-        if (last_ctick % (unsigned int)cmd_cf->cf_save->stable->target_pfreq == 0 || last_ctick < 1000) {
-            RTPP_LOG(cmd_cf->cf_save->stable->glog, RTPP_LOG_DBUG, "rtpp_cmd_queue_run %lld sptime %f eptime %f, CSV: %f,%f,%f,%f,%f", \
-              last_ctick, sptime, eptime, (double)last_ctick / cmd_cf->cf_save->stable->target_pfreq, \
-              eptime - sptime + tused, eptime, sptime, tused);
-            RTPP_LOG(cmd_cf->cf_save->stable->glog, RTPP_LOG_DBUG, "run %lld average load %f, CSV: %f,%f", last_ctick, \
-              cmd_cf->average_load.lastval * 100.0, (double)last_ctick / cmd_cf->cf_save->stable->target_pfreq, cmd_cf->average_load.lastval);
+        if (last_ctick % (unsigned int)cmd_cf->cf_save->target_pfreq == 0 || last_ctick < 1000) {
+            RTPP_LOG(cmd_cf->cf_save->glog, RTPP_LOG_DBUG, "rtpp_cmd_queue_run %lld sptime %f eptime %f, CSV: %f,%f,%f,%f,%f", \
+              last_ctick, sptime.mono, eptime, (double)last_ctick / cmd_cf->cf_save->target_pfreq, \
+              eptime - sptime.mono + tused, eptime, sptime.mono, tused);
+            RTPP_LOG(cmd_cf->cf_save->glog, RTPP_LOG_DBUG, "run %lld average load %f, CSV: %f,%f", last_ctick, \
+              cmd_cf->average_load.lastval * 100.0, (double)last_ctick / cmd_cf->cf_save->target_pfreq, cmd_cf->average_load.lastval);
         }
 #endif
 #endif
@@ -488,7 +492,7 @@ rtpp_command_async_get_aload(struct rtpp_cmd_async *pub)
     double aload;
     struct rtpp_cmd_async_cf *cmd_cf;
 
-    cmd_cf = PUB2PVT(pub);
+    PUB2PVT(pub, cmd_cf);
 
     pthread_mutex_lock(&cmd_cf->cmd_mutex);
     aload = cmd_cf->average_load.lastval;
@@ -506,7 +510,7 @@ rtpp_command_async_wakeup(struct rtpp_cmd_async *pub)
     int old_clock;
     struct rtpp_cmd_async_cf *cmd_cf;
 
-    cmd_cf = PUB2PVT(pub);
+    PUB2PVT(pub, cmd_cf);
 
     pthread_mutex_lock(&cmd_cf->cmd_mutex);
 
@@ -526,7 +530,7 @@ rtpp_command_async_reg_overload(struct rtpp_cmd_async *pub, int overload)
 {
     struct rtpp_cmd_async_cf *cmd_cf;
 
-    cmd_cf = PUB2PVT(pub);
+    PUB2PVT(pub, cmd_cf);
 
     pthread_mutex_lock(&cmd_cf->cmd_mutex);
     cmd_cf->overload = overload;
@@ -539,7 +543,7 @@ rtpp_command_async_chk_overload(struct rtpp_cmd_async *pub)
     struct rtpp_cmd_async_cf *cmd_cf;
     int rval;
 
-    cmd_cf = PUB2PVT(pub);
+    PUB2PVT(pub, cmd_cf);
 
     pthread_mutex_lock(&cmd_cf->cmd_mutex);
     rval = cmd_cf->overload;
@@ -548,13 +552,13 @@ rtpp_command_async_chk_overload(struct rtpp_cmd_async *pub)
 }
 
 static int
-init_pollset(struct cfg *cf, struct rtpp_cmd_pollset *psp)
+init_pollset(const struct rtpp_cfg *cfsp, struct rtpp_cmd_pollset *psp)
 {
     struct rtpp_ctrl_sock *ctrl_sock;
     int pfds_used, msize, i;
 
     pfds_used = 0;
-    ctrl_sock = RTPP_LIST_HEAD(cf->stable->ctrl_socks);
+    ctrl_sock = RTPP_LIST_HEAD(cfsp->ctrl_socks);
     for (pfds_used = 0; ctrl_sock != NULL; ctrl_sock = RTPP_ITER_NEXT(ctrl_sock)) {
         if (RTPP_CTRL_ACCEPTABLE(ctrl_sock))
             continue;
@@ -566,14 +570,13 @@ init_pollset(struct cfg *cf, struct rtpp_cmd_pollset *psp)
         return (-1);
     }
     if (pthread_mutex_init(&psp->pfds_mutex, NULL) != 0) {
-        free(psp->pfds);
-        return (-1);
+        goto e1;
     }
     psp->pfds_used = pfds_used;
     if (psp->pfds_used == 0) {
         return (0);
     }
-    ctrl_sock = RTPP_LIST_HEAD(cf->stable->ctrl_socks);
+    ctrl_sock = RTPP_LIST_HEAD(cfsp->ctrl_socks);
     for (i = 0; ctrl_sock != NULL; ctrl_sock = RTPP_ITER_NEXT(ctrl_sock)) {
         if (RTPP_CTRL_ACCEPTABLE(ctrl_sock))
             continue;
@@ -582,12 +585,22 @@ init_pollset(struct cfg *cf, struct rtpp_cmd_pollset *psp)
         psp->pfds[i].revents = 0;
         psp->rccs[i] = rtpp_cmd_connection_ctor(ctrl_sock->controlfd_in, 
           ctrl_sock->controlfd_out, ctrl_sock, NULL);
+        if (psp->rccs[i] == NULL) {
+            int j;
+
+            for (j = i - 1; j >= 0; j --)
+                rtpp_cmd_connection_dtor(psp->rccs[j]);
+            goto e1;
+        }
         i++;
     }
     if (i == 1 && RTPP_CTRL_ISSTREAM(psp->rccs[0]->csock)) {
         psp->rccs[0]->csock->exit_on_close = 1;
     }
     return (0);
+e1:
+    free(psp->pfds);
+    return (-1);
 }
 
 static void
@@ -602,13 +615,13 @@ free_pollset(struct rtpp_cmd_pollset *psp)
 }
 
 static int
-init_accptset(struct cfg *cf, struct rtpp_cmd_accptset *asp)
+init_accptset(const struct rtpp_cfg *cfsp, struct rtpp_cmd_accptset *asp)
 {
     int i, pfds_used;
     struct rtpp_ctrl_sock *ctrl_sock;
 
     pfds_used = 0;
-    ctrl_sock = RTPP_LIST_HEAD(cf->stable->ctrl_socks);
+    ctrl_sock = RTPP_LIST_HEAD(cfsp->ctrl_socks);
     for (pfds_used = 0; ctrl_sock != NULL; ctrl_sock = RTPP_ITER_NEXT(ctrl_sock)) {
         if (RTPP_CTRL_ACCEPTABLE(ctrl_sock) == 0)
             continue;
@@ -628,7 +641,7 @@ init_accptset(struct cfg *cf, struct rtpp_cmd_accptset *asp)
         free(asp->pfds);
         return (-1);
     }
-    ctrl_sock = RTPP_LIST_HEAD(cf->stable->ctrl_socks);
+    ctrl_sock = RTPP_LIST_HEAD(cfsp->ctrl_socks);
     for (i = 0; i < asp->pfds_used; ctrl_sock = RTPP_ITER_NEXT(ctrl_sock)) {
         if (RTPP_CTRL_ACCEPTABLE(ctrl_sock) == 0)
             continue;
@@ -651,7 +664,7 @@ free_accptset(struct rtpp_cmd_accptset *asp)
 }
 
 struct rtpp_cmd_async *
-rtpp_command_async_ctor(struct cfg *cf)
+rtpp_command_async_ctor(struct rtpp_cfg *cfsp)
 {
     struct rtpp_cmd_async_cf *cmd_cf;
     int need_acptr, i;
@@ -660,15 +673,15 @@ rtpp_command_async_ctor(struct cfg *cf)
     if (cmd_cf == NULL)
         goto e0;
 
-    if (init_pollset(cf, &cmd_cf->pset) == -1) {
+    if (init_pollset(cfsp, &cmd_cf->pset) == -1) {
         goto e1;
     }
-    need_acptr = init_accptset(cf, &cmd_cf->aset);
+    need_acptr = init_accptset(cfsp, &cmd_cf->aset);
     if (need_acptr == -1) {
         goto e2;
     }
 
-    init_cstats(cf->stable->rtpp_stats, &cmd_cf->cstats);
+    init_cstats(cfsp->rtpp_stats, &cmd_cf->cstats);
 
     if (pthread_cond_init(&cmd_cf->cmd_cond, NULL) != 0) {
         goto e3;
@@ -676,8 +689,8 @@ rtpp_command_async_ctor(struct cfg *cf)
     if (pthread_mutex_init(&cmd_cf->cmd_mutex, NULL) != 0) {
         goto e4;
     }
-    assert(cf->stable->rtpp_timed_cf != NULL);
-    cmd_cf->rcache = rtpp_cmd_rcache_ctor(cf->stable->rtpp_timed_cf,
+    assert(cfsp->rtpp_timed_cf != NULL);
+    cmd_cf->rcache = rtpp_cmd_rcache_ctor(cfsp->rtpp_timed_cf,
       32.0 + 3.0);
     if (cmd_cf->rcache == NULL) {
         goto e5;
@@ -687,7 +700,7 @@ rtpp_command_async_ctor(struct cfg *cf)
     recfilter_init(&cmd_cf->average_load, 0.999, 0.0, 1);
 #endif
 
-    cmd_cf->cf_save = cf;
+    cmd_cf->cf_save = cfsp;
     if (need_acptr != 0) {
         if (pthread_create(&cmd_cf->acpt_thread_id, NULL,
           (void *(*)(void *))&rtpp_cmd_acceptor_run, cmd_cf) != 0) {
@@ -715,7 +728,7 @@ e7:
     }
 e6:
     CALL_METHOD(cmd_cf->rcache, shutdown);
-    CALL_SMETHOD(cmd_cf->rcache->rcnt, decref);
+    RTPP_OBJ_DECREF(cmd_cf->rcache);
 e5:
     pthread_mutex_destroy(&cmd_cf->cmd_mutex);
 e4:
@@ -736,7 +749,7 @@ rtpp_command_async_dtor(struct rtpp_cmd_async *pub)
     struct rtpp_cmd_async_cf *cmd_cf;
     int i;
 
-    cmd_cf = PUB2PVT(pub);
+    PUB2PVT(pub, cmd_cf);
 
     pthread_mutex_lock(&cmd_cf->cmd_mutex);
     cmd_cf->tstate_queue = TSTATE_CEASE;
@@ -755,7 +768,7 @@ rtpp_command_async_dtor(struct rtpp_cmd_async *pub)
         pthread_join(cmd_cf->acpt_thread_id, NULL);
     }
     CALL_METHOD(cmd_cf->rcache, shutdown);
-    CALL_SMETHOD(cmd_cf->rcache->rcnt, decref);
+    RTPP_OBJ_DECREF(cmd_cf->rcache);
     pthread_cond_destroy(&cmd_cf->cmd_cond);
     pthread_mutex_destroy(&cmd_cf->cmd_mutex);
     free_pollset(&cmd_cf->pset);

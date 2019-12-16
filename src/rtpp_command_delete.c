@@ -35,10 +35,11 @@
 #include "config.h"
 
 #include "rtpp_defines.h"
-#include "rtpp_cfg_stable.h"
+#include "rtpp_cfg.h"
 #include "rtpp_log.h"
 #include "rtpp_command.h"
 #include "rtpp_command_delete.h"
+#include "rtpp_command_ecodes.h"
 #include "rtpp_command_private.h"
 #include "rtpp_types.h"
 #include "rtpp_hash_table.h"
@@ -56,6 +57,8 @@ struct delete_ematch_arg {
     int weak;
     struct rtpp_weakref_obj *sessions_wrt;
 };
+
+static void rtpp_command_del_opts_free(struct delete_opts *);
 
 static int
 rtpp_cmd_delete_ematch(void *dp, void *ap)
@@ -117,7 +120,7 @@ struct delete_opts {
 };
 
 int
-handle_delete(struct cfg *cf, struct common_cmd_args *ccap)
+handle_delete(const struct rtpp_cfg *cfsp, struct common_cmd_args *ccap)
 {
     struct delete_ematch_arg dea;
 
@@ -125,8 +128,8 @@ handle_delete(struct cfg *cf, struct common_cmd_args *ccap)
     dea.from_tag = ccap->from_tag;
     dea.to_tag = ccap->to_tag;
     dea.weak = ccap->opts.delete->weak;
-    dea.sessions_wrt = cf->stable->sessions_wrt;
-    CALL_METHOD(cf->stable->sessions_ht, foreach_key, ccap->call_id,
+    dea.sessions_wrt = cfsp->sessions_wrt;
+    CALL_METHOD(cfsp->sessions_ht, foreach_key, ccap->call_id,
       rtpp_cmd_delete_ematch, &dea);
     rtpp_command_del_opts_free(ccap->opts.delete);
     ccap->opts.delete = NULL;
@@ -144,7 +147,7 @@ rtpp_command_del_opts_parse(struct rtpp_command *cmd)
         reply_error(cmd, ECODE_NOMEM_1);
         goto err_undo_0;
     }
-    for (cp = cmd->argv[0] + 1; *cp != '\0'; cp++) {
+    for (cp = cmd->args.v[0] + 1; *cp != '\0'; cp++) {
         switch (*cp) {
         case 'w':
         case 'W':
@@ -166,7 +169,7 @@ err_undo_0:
     return (NULL);
 }
 
-void
+static void
 rtpp_command_del_opts_free(struct delete_opts *dlop)
 {
 

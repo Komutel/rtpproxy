@@ -44,6 +44,7 @@ struct rtpp_netaddr;
 struct sthread_args;
 struct rtpp_acct_hold;
 struct rtpp_proc_rstats;
+struct rtpp_timestamp;
 
 DEFINE_METHOD(rtpp_stream, rtpp_stream_handle_play, int, const char *,
   const char *, int, struct rtpp_command *, int);
@@ -60,7 +61,6 @@ DEFINE_METHOD(rtpp_stream, rtpp_stream_set_skt, void, struct rtpp_socket *);
 DEFINE_METHOD(rtpp_stream, rtpp_stream_get_skt, struct rtpp_socket *);
 DEFINE_METHOD(rtpp_stream, rtpp_stream_update_skt, struct rtpp_socket *,
   struct rtpp_socket *);
-DEFINE_METHOD(rtpp_stream, rtpp_stream_drain_skt, int);
 DEFINE_METHOD(rtpp_stream, rtpp_stream_send_pkt, int, struct sthread_args *,
   struct rtp_packet *);
 DEFINE_METHOD(rtpp_stream, rtpp_stream_issendable, int);
@@ -69,7 +69,7 @@ DEFINE_METHOD(rtpp_stream, rtpp_stream_reg_onhold, void);
 DEFINE_METHOD(rtpp_stream, rtpp_stream_get_stats, void,
   struct rtpp_acct_hold *);
 DEFINE_METHOD(rtpp_stream, rtpp_stream_rx, struct rtp_packet *,
-  struct rtpp_weakref_obj *, double, struct rtpp_proc_rstats *);
+  struct rtpp_weakref_obj *, const struct rtpp_timestamp *, struct rtpp_proc_rstats *);
 DEFINE_METHOD(rtpp_stream, rtpp_stream_get_rem_addr, struct rtpp_netaddr *,
   int);
 
@@ -90,7 +90,6 @@ struct rtpp_stream_smethods {
     METHOD_ENTRY(rtpp_stream_set_skt, set_skt);
     METHOD_ENTRY(rtpp_stream_get_skt, get_skt);
     METHOD_ENTRY(rtpp_stream_update_skt, update_skt);
-    METHOD_ENTRY(rtpp_stream_drain_skt, drain_skt);
     METHOD_ENTRY(rtpp_stream_send_pkt, send_pkt);
     METHOD_ENTRY(rtpp_stream_issendable, issendable);
     METHOD_ENTRY(rtpp_stream_locklatch, locklatch);
@@ -104,9 +103,10 @@ struct rtpp_stream {
     /* ttl for stream */
     struct rtpp_ttl *ttl;
     /* Local listen address/port */
-    struct sockaddr *laddr;
+    const struct sockaddr *laddr;
     int port;
     int asymmetric;
+    enum rtpp_stream_side side;
     /* Flags: strong create/delete; weak ones */
     int weak;
     /* Pointer to rtpp_record's opaque data type */

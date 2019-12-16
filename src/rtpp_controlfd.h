@@ -37,6 +37,10 @@ struct rtpp_ctrl_sock {
     int controlfd_out;
     int port_ctl;                   /* Port number for UDP control, 0 for Unix domain */
     int exit_on_close;
+    struct {				/* Temporary space for emergencies (i.e. ENOMEM) */
+        char buf[RTPP_CMD_BUFLEN];	/* I/O scrap buffer */
+        struct sockaddr_storage addr;	/* space to store receiver's address */
+    } emrg;
     struct sockaddr_storage bindaddr;
 };
 
@@ -45,10 +49,10 @@ struct rtpp_ctrl_sock {
 #define RTPP_CTRL_ISSTREAM(rcsp) ((rcsp)->type == RTPC_IFSUN_C || (rcsp)->type == RTPC_STDIO \
   || (rcsp)->type == RTPC_TCP4 || (rcsp)->type == RTPC_TCP6)
 #define RTPP_CTRL_ACCEPTABLE(rcsp) ((rcsp)->type == RTPC_IFSUN || (rcsp)->type == RTPC_IFSUN_C \
-  || (rcsp)->type == RTPC_TCP4 || (rcsp)->type == RTPC_TCP6)
+  || (rcsp)->type == RTPC_TCP4 || (rcsp)->type == RTPC_TCP6 || (rcsp)->type == RTPC_SYSD)
 
-int rtpp_controlfd_init(struct cfg *cf);
+int rtpp_controlfd_init(const struct rtpp_cfg *);
 struct rtpp_ctrl_sock *rtpp_ctrl_sock_parse(const char *);
 const char *rtpp_ctrl_sock_describe(struct rtpp_ctrl_sock *);
-void rtpp_controlfd_cleanup(struct cfg *cf);
-int rtpp_csock_addrlen(struct rtpp_ctrl_sock *);
+void rtpp_controlfd_cleanup(const struct rtpp_cfg *);
+socklen_t rtpp_csock_addrlen(struct rtpp_ctrl_sock *);

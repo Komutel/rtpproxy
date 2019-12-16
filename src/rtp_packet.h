@@ -31,26 +31,30 @@
 
 struct rtp_info;
 struct rtpp_wi;
+struct rtpp_refcnt;
+
+#define MAX_RPKT_LEN 8192
 
 struct rtp_packet {
+    struct rtpp_refcnt *rcnt;
+    struct rtpp_wi *wi;
+    struct rtp_packet *next;
+    struct rtp_packet *prev;
+
+    struct rtp_info *parsed;
+    /* ^^^ Elements above are not copied by the rtp_packet_dup() ^^^ */
+    rtp_parser_err_t parse_result;
+
     size_t      size;
 
     struct sockaddr_storage raddr;
     struct sockaddr_storage sendto;
     struct sockaddr_storage _laddr;
-    struct sockaddr *laddr;
+    const struct sockaddr *laddr;
     int         lport;
 
     socklen_t   rlen;
-    double      rtime;
-
-    struct rtp_packet *next;
-    struct rtp_packet *prev;
-
-    struct rtp_info *parsed;
-    rtp_parser_err_t parse_result;
-
-    struct rtpp_wi *wi;
+    struct rtpp_timestamp rtime;
 
     /*
      * The packet, keep it the last member so that we can use
@@ -59,12 +63,13 @@ struct rtp_packet {
      */
     union {
         rtp_hdr_t       header;
-        unsigned char   buf[8192];
+        unsigned char   buf[MAX_RPKT_LEN];
     } data;
 };
 
+#define RTP_PKT_COPYOFF(x) (offsetof(typeof(*x), parse_result))
+
 struct rtp_packet *rtp_packet_alloc();
-void rtp_packet_free(struct rtp_packet *);
 void rtp_packet_set_seq(struct rtp_packet *, uint16_t seq);
 void rtp_packet_set_ts(struct rtp_packet *, uint32_t ts);
 

@@ -39,6 +39,8 @@
 #include <string.h>
 #include <stdlib.h>
 
+#include <pthread.h>
+
 #if !defined(MEMDEB_APP)
 #error MEMDEB_APP has to be defined
 #endif
@@ -85,7 +87,7 @@ void rtpp_memdeb_free_n(void *, void *, const char *, int, const char *);
 void *rtpp_memdeb_realloc(void *, size_t, void *, const char *, int, const char *);
 char *rtpp_memdeb_strdup(const char *, void *, const char *, int, const char *);
 int rtpp_memdeb_asprintf(char **, const char *, void *, const char *, int, \
-  const char *, ...);
+  const char *, ...) __attribute__ ((format (printf, 6, 7)));
 void *rtpp_memdeb_memcpy(void *dst, const void *src, size_t len, void *, \
   const char *, int, const char *);
 void *rtpp_memdeb_calloc(size_t number, size_t size, void *, \

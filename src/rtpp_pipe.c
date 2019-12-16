@@ -40,14 +40,16 @@
 #include "rtpp_refcnt.h"
 #include "rtpp_log_obj.h"
 #include "rtpp_weakref.h"
+#include "rtpp_time.h"
 #include "rtpp_stream.h"
 #include "rtpp_pipe.h"
+#include "rtpp_pipe_fin.h"
 #include "rtpp_ttl.h"
 #include "rtpp_math.h"
 #include "rtpp_acct_pipe.h"
 #include "rtpp_pcnt_strm.h"
+#include "rtpp_pcnts_strm.h"
 #include "rtpp_stats.h"
-#include "rtpp_monotime.h"
 
 struct rtpp_pipe_priv
 {
@@ -55,8 +57,6 @@ struct rtpp_pipe_priv
     struct rtpp_weakref_obj *streams_wrt;
     int pipe_type;
 };
-
-#define PUB2PVT(pubp)      ((struct rtpp_pipe_priv *)((char *)(pubp) - offsetof(struct rtpp_pipe_priv, pub)))
 
 static void rtpp_pipe_dtor(struct rtpp_pipe_priv *);
 static int rtpp_pipe_get_ttl(struct rtpp_pipe *);
@@ -67,8 +67,8 @@ static void rtpp_pipe_upd_cntrs(struct rtpp_pipe *, struct rtpp_acct_pipe *);
 #define NO_MED_NM(t) (((t) == PIPE_RTP) ? "nsess_nortp" : "nsess_nortcp")
 #define OW_MED_NM(t) (((t) == PIPE_RTP) ? "nsess_owrtp" : "nsess_owrtcp")
 
-#define MT2RT_NZ(mt) ((mt) == 0.0 ? 0.0 : dtime2rtime(mt))
-#define DRTN_NZ(bmt, emt) ((emt) == 0.0 || (bmt) == 0.0 ? 0.0 : ((emt) - (bmt)))
+#define MT2RT_NZ(mt) ((mt).wall)
+#define DRTN_NZ(bmt, emt) ((emt).mono == 0.0 || (bmt).mono == 0.0 ? 0.0 : ((emt).mono - (bmt).mono))
 
 struct rtpp_pipe *
 rtpp_pipe_ctor(uint64_t seuid, struct rtpp_weakref_obj *streams_wrt,
@@ -76,14 +76,12 @@ rtpp_pipe_ctor(uint64_t seuid, struct rtpp_weakref_obj *streams_wrt,
   struct rtpp_stats *rtpp_stats, int pipe_type)
 {
     struct rtpp_pipe_priv *pvt;
-    struct rtpp_refcnt *rcnt;
     int i;
 
-    pvt = rtpp_rzmalloc(sizeof(struct rtpp_pipe_priv), &rcnt);
+    pvt = rtpp_rzmalloc(sizeof(struct rtpp_pipe_priv), PVT_RCOFFS(pvt));
     if (pvt == NULL) {
         goto e0;
     }
-    pvt->pub.rcnt = rcnt;
 
     pvt->streams_wrt = streams_wrt;
 
@@ -106,7 +104,7 @@ rtpp_pipe_ctor(uint64_t seuid, struct rtpp_weakref_obj *streams_wrt,
         goto e2;
     }
     for (i = 0; i < 2; i++) {
-        CALL_SMETHOD(pvt->pub.pcount->rcnt, incref);
+        RTPP_OBJ_INCREF(pvt->pub.pcount);
         pvt->pub.stream[i]->pcount = pvt->pub.pcount;
     }
     pvt->pipe_type = pipe_type;
@@ -116,7 +114,7 @@ rtpp_pipe_ctor(uint64_t seuid, struct rtpp_weakref_obj *streams_wrt,
     pvt->pub.decr_ttl = &rtpp_pipe_decr_ttl;
     pvt->pub.get_stats = &rtpp_pipe_get_stats;
     pvt->pub.upd_cntrs = &rtpp_pipe_upd_cntrs;
-    CALL_SMETHOD(log->rcnt, incref);
+    RTPP_OBJ_INCREF(log);
     CALL_SMETHOD(pvt->pub.rcnt, attach, (rtpp_refcnt_dtor_t)&rtpp_pipe_dtor, pvt);
     return (&pvt->pub);
 
@@ -125,10 +123,10 @@ e1:
     for (i = 0; i < 2; i++) {
         if (pvt->pub.stream[i] != NULL) {
             CALL_METHOD(pvt->streams_wrt, unreg, pvt->pub.stream[i]->stuid);
-            CALL_SMETHOD(pvt->pub.stream[i]->rcnt, decref);
+            RTPP_OBJ_DECREF(pvt->pub.stream[i]);
         }
     }
-    CALL_SMETHOD(pvt->pub.rcnt, decref);
+    RTPP_OBJ_DECREF(&(pvt->pub));
     free(pvt);
 e0:
     return (NULL);
@@ -139,12 +137,13 @@ rtpp_pipe_dtor(struct rtpp_pipe_priv *pvt)
 {
     int i;
 
+    rtpp_pipe_fin(&(pvt->pub));
     for (i = 0; i < 2; i++) {
         CALL_METHOD(pvt->streams_wrt, unreg, pvt->pub.stream[i]->stuid);
-        CALL_SMETHOD(pvt->pub.stream[i]->rcnt, decref);
+        RTPP_OBJ_DECREF(pvt->pub.stream[i]);
     }
-    CALL_SMETHOD(pvt->pub.pcount->rcnt, decref);
-    CALL_SMETHOD(pvt->pub.log->rcnt, decref);
+    RTPP_OBJ_DECREF(pvt->pub.pcount);
+    RTPP_OBJ_DECREF(pvt->pub.log);
     free(pvt);
 }
 
@@ -172,7 +171,7 @@ rtpp_pipe_get_stats(struct rtpp_pipe *self, struct rtpp_acct_pipe *rapp)
 {
     struct rtpp_pipe_priv *pvt;
 
-    pvt = PUB2PVT(self);
+    PUB2PVT(self, pvt);
 
     CALL_METHOD(self->pcount, get_stats, rapp->pcnts);
     CALL_SMETHOD(self->stream[0], get_stats, &rapp->o.hld_stat);
@@ -189,13 +188,13 @@ rtpp_pipe_get_stats(struct rtpp_pipe *self, struct rtpp_acct_pipe *rapp)
     if (pvt->pipe_type != PIPE_RTP) {
         return;
     }
-    if (rapp->o.ps->first_pkt_rcv > 0.0) {
+    if (rapp->o.ps->first_pkt_rcv.mono > 0.0) {
         RTPP_LOG(self->log, RTPP_LOG_INFO, "RTP times: caller: first in at %f, "
           "duration %f, longest IPI %f", MT2RT_NZ(rapp->o.ps->first_pkt_rcv),
           DRTN_NZ(rapp->o.ps->first_pkt_rcv, rapp->o.ps->last_pkt_rcv),
           rapp->o.ps->longest_ipi);
     }
-    if (rapp->a.ps->first_pkt_rcv > 0.0) {
+    if (rapp->a.ps->first_pkt_rcv.mono > 0.0) {
         RTPP_LOG(self->log, RTPP_LOG_INFO, "RTP times: callee: first in at %f, "
           "duration %f, longest IPI %f", MT2RT_NZ(rapp->a.ps->first_pkt_rcv),
           DRTN_NZ(rapp->a.ps->first_pkt_rcv, rapp->a.ps->last_pkt_rcv),
@@ -209,7 +208,7 @@ rtpp_pipe_upd_cntrs(struct rtpp_pipe *self, struct rtpp_acct_pipe *rapp)
 {
     struct rtpp_pipe_priv *pvt;
 
-    pvt = PUB2PVT(self);
+    PUB2PVT(self, pvt);
 
     if (rapp->o.ps->npkts_in == 0 && rapp->a.ps->npkts_in == 0) {
         CALL_SMETHOD(self->rtpp_stats, updatebyname, NO_MED_NM(pvt->pipe_type),

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014 Sippy Software, Inc., http://www.sippysoft.com
+ * Copyright (c) 2014-2019 Sippy Software, Inc., http://www.sippysoft.com
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -30,71 +30,300 @@
 #define _GNU_SOURCE
 #endif
 
+#include <assert.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
-
-#include <sys/types.h>
-#include <sys/socket.h>
+#include <string.h>
 
 #include "rtpp_types.h"
 #include "rtpp_queue.h"
 #include "rtpp_mallocs.h"
 #include "rtpp_wi.h"
-#include "rtpp_wi_private.h"
+#include "rtpp_debug.h"
+
+#define RTPQ_DEBUG 0
+
+typedef struct {
+    unsigned int buflen;
+    unsigned int head;
+    unsigned int tail;
+    struct rtpp_wi *buffer[0];
+} circ_buf_t;
+
+static int
+circ_buf_isempty(const circ_buf_t *c)
+{
+
+    return (c->head == c->tail); /* if the head == tail, we don't have any data */
+}
+
+static int
+circ_buf_push(circ_buf_t *c, struct rtpp_wi *data)
+{
+    unsigned int next;
+
+    next = c->head + 1;  /* next is where head will point to after this write. */
+    if (next == c->buflen)
+        next = 0;
+
+    if (next == c->tail)  /* if the head + 1 == tail, circular buffer is full */
+        return(-1);
+
+#ifdef RTPQ_DEBUG
+    assert(c->buffer[c->head] == NULL);
+#endif
+    c->buffer[c->head] = data;  /* Load data and then move */
+    c->head = next;             /* head to next data offset. */
+    return(0);  /* return success to indicate successful push. */
+}
+
+static int
+circ_buf_pop(circ_buf_t *c, struct rtpp_wi **data)
+{
+    unsigned int next;
+
+    if (circ_buf_isempty(c))
+        return(-1);
+
+    next = c->tail + 1;  /* next is where tail will point to after this read. */
+    if (next == c->buflen)
+        next = 0;
+#ifdef RTPQ_DEBUG
+    assert(c->tail < c->buflen);
+#endif
+
+    *data = c->buffer[c->tail];  /* Read data and then move */
+#ifdef RTPQ_DEBUG
+    c->buffer[c->tail] = NULL;
+#endif
+    c->tail = next;              /* tail to next offset. */
+    return(0);  /* return success to indicate successful pop. */
+}
+
+static unsigned int
+circ_buf_popmany(circ_buf_t *c, struct rtpp_wi *data[], unsigned int howmany)
+{
+    unsigned int next;
+    unsigned int last;
+    unsigned int copyn;
+    unsigned int rval;
+
+    rval = 0;
+    RTPP_DBG_ASSERT(howmany > 0);
+    while (!circ_buf_isempty(c)) {
+        next = last = c->tail + howmany - rval;
+        if (c->head < c->tail) {
+            if (last >= c->buflen) {
+                last = c->buflen;
+                next = 0;
+            }
+        } else {
+            if (last > c->head) {
+                last = c->head;
+                next = c->head;
+            }
+        }
+        copyn = last - c->tail;
+        memcpy(data, &(c->buffer[c->tail]), copyn * sizeof(data[0]));
+#ifdef RTPQ_DEBUG
+        memset(&(c->buffer[c->tail]), '\0', copyn * sizeof(data[0]));
+#endif
+        c->tail = next;
+        rval += copyn;
+        if (rval == howmany)
+            break;
+        data += copyn;
+    }
+#ifdef RTPQ_DEBUG
+    assert(rval <= howmany);
+    assert(c->tail < c->buflen);
+#endif
+
+    return(rval); /* Return number of objects popped */
+}
+
+static int
+circ_buf_peek(const circ_buf_t *c, unsigned int offset, struct rtpp_wi **data)
+{
+    unsigned int itmidx, clen;
+
+    if (circ_buf_isempty(c))
+        return(-1);
+
+    if (c->head < c->tail) {
+       clen = (c->head + c->buflen) - c->tail;
+    } else {
+       clen = c->head - c->tail;
+    }
+    if (offset >= clen)
+        return(-1);
+
+    itmidx = c->tail + offset;  /* itmidx points to the item in question */
+    if(itmidx >= c->buflen)
+        itmidx -= c->buflen;
+#ifdef RTPQ_DEBUG
+    assert(itmidx < c->buflen);
+    assert(c->buffer[itmidx] != NULL);
+#endif
+
+    *data = c->buffer[itmidx];  /* Read data and then move */
+    return(0);  /* return success to indicate successful pop. */
+}
+
+static int
+circ_buf_replace(circ_buf_t *c, unsigned int offset, struct rtpp_wi **data)
+{
+    unsigned int itmidx, clen;
+    struct rtpp_wi *tdata;
+
+    if (circ_buf_isempty(c))
+        return(-1);
+
+    if (c->head < c->tail) {
+       clen = (c->head + c->buflen) - c->tail;
+    } else {
+       clen = c->head - c->tail;
+    }
+    if (offset >= clen)
+        return(-1);
+
+    itmidx = c->tail + offset;  /* itmidx points to the item in question */
+    if(itmidx >= c->buflen)
+        itmidx -= c->buflen;
+#ifdef RTPQ_DEBUG
+    assert(itmidx < c->buflen);
+    assert(c->buffer[itmidx] != NULL);
+#endif
+    tdata = c->buffer[itmidx];
+#ifdef RTPQ_DEBUG
+    assert(tdata != NULL);
+#endif
+    c->buffer[itmidx] = *data;  /* Read data and then replace */
+    *data = tdata;
+    return(0);  /* return success to indicate successful pop. */
+}
+
+static int
+circ_buf_remove(circ_buf_t *c, unsigned int offset)
+{
+    unsigned int clen;
+    struct rtpp_wi *data;
+
+    if (circ_buf_isempty(c))
+        return(-1);
+
+    if (c->head < c->tail) {
+       clen = (c->head + c->buflen) - c->tail;
+    } else {
+       clen = c->head - c->tail;
+    }
+    if (offset >= clen)
+        return(-1);
+
+    for (; offset > 0; offset--) {
+        assert(circ_buf_peek(c, offset - 1, &data) == 0);
+        assert(circ_buf_replace(c, offset, &data) == 0);
+    }
+#ifdef RTPQ_DEBUG
+    assert(c->buffer[c->tail] != NULL);
+    c->buffer[c->tail] = NULL;
+#endif
+    c->tail += 1;
+    if (c->tail == c->buflen)
+        c->tail = 0;
+    return(0);  /* return success to indicate successful removal. */
+}
 
 struct rtpp_queue
 {
+    char const *name;
     struct rtpp_wi *head;
     struct rtpp_wi *tail;
     pthread_cond_t cond;
     pthread_mutex_t mutex;
-    int length;
-    char *name;
-    int qlen;
+    unsigned int length;
+    unsigned int qlen;
+    circ_buf_t circb;
 };
 
 struct rtpp_queue *
-rtpp_queue_init(int qlen, const char *fmt, ...)
+rtpp_queue_init(unsigned int cb_capacity, const char *fmt, ...)
 {
     struct rtpp_queue *queue;
+    unsigned int cb_buflen;
+    char *name;
     va_list ap;
     int eval;
 
-    queue = rtpp_zmalloc(sizeof(*queue));
+    cb_buflen = cb_capacity + 1;
+    queue = rtpp_zmalloc(sizeof(*queue) + (sizeof(queue->circb.buffer[0]) * cb_buflen));
     if (queue == NULL)
-        return (NULL);
-    queue->qlen = qlen;
+        goto e0;
     if ((eval = pthread_cond_init(&queue->cond, NULL)) != 0) {
-        free(queue);
-        return (NULL);
+        goto e1;
     }
     if (pthread_mutex_init(&queue->mutex, NULL) != 0) {
-        pthread_cond_destroy(&queue->cond);
-        free(queue);
-        return (NULL);
+        goto e2;
     }
     va_start(ap, fmt);
-    vasprintf(&queue->name, fmt, ap);
+    vasprintf(&name, fmt, ap);
     va_end(ap);
-    if (queue->name == NULL) {
-        pthread_cond_destroy(&queue->cond);
-        pthread_mutex_destroy(&queue->mutex);
-        free(queue);
-        return (NULL);
+    if (name == NULL) {
+        goto e3;
     }
+    queue->qlen = 1;
+    queue->name = name;
+    queue->circb.buflen = cb_buflen;
     return (queue);
+e3:
+    pthread_mutex_destroy(&queue->mutex);
+e2:
+    pthread_cond_destroy(&queue->cond);
+e1:
+    free(queue);
+e0:
+    return (NULL);
 }
 
 void
 rtpp_queue_destroy(struct rtpp_queue *queue)
 {
-
+    while (rtpp_queue_get_length(queue) > 0) {
+        CALL_METHOD(rtpp_queue_get_item(queue, 0), dtor);
+    }
     pthread_cond_destroy(&queue->cond);
     pthread_mutex_destroy(&queue->mutex);
-    free(queue->name);
+    free((void *)queue->name);
     free(queue);
+}
+
+static int
+rtpp_queue_getclen(const struct rtpp_queue *queue)
+{
+    int clen;
+
+    clen = queue->length;
+    if (queue->circb.head < queue->circb.tail) {
+       clen += (queue->circb.head + queue->circb.buflen) - queue->circb.tail;
+    } else if (queue->circb.head > queue->circb.tail) {
+       clen += queue->circb.head - queue->circb.tail;
+    }
+
+    return (clen);
+}
+
+unsigned int
+rtpp_queue_setqlen(struct rtpp_queue *queue, unsigned int qlen)
+{
+    unsigned int rval;
+
+    pthread_mutex_lock(&queue->mutex);
+    rval = queue->qlen;
+    queue->qlen = qlen;
+    pthread_mutex_unlock(&queue->mutex);
+    return (rval);
 }
 
 void
@@ -102,13 +331,19 @@ rtpp_queue_put_item(struct rtpp_wi *wi, struct rtpp_queue *queue)
 {
 
     pthread_mutex_lock(&queue->mutex);
-    RTPPQ_APPEND(queue, wi);
+    /*
+     * If queue is not empty, push to the queue so that order of elements
+     * is preserved while pulling them out.
+     */
+    if ((queue->length > 0) || (circ_buf_push(&queue->circb, wi) != 0)) {
+        RTPPQ_APPEND(queue, wi);
 #if 0
-    if (queue->length > 99 && queue->length % 100 == 0)
-        fprintf(stderr, "queue(%s): length %d\n", queue->name, queue->length);
+        if (queue->length > 99 && queue->length % 100 == 0)
+            fprintf(stderr, "queue(%s): length %d\n", queue->name, queue->length);
 #endif
+    }
 
-    if ((queue->qlen > 0 && queue->length % queue->qlen == 0) || wi->wi_type == RTPP_WI_TYPE_SGNL) {
+    if ((queue->qlen == 1) || (queue->qlen > 1 && rtpp_queue_getclen(queue) % queue->qlen == 0) || wi->wi_type == RTPP_WI_TYPE_SGNL) {
         /* notify worker thread */
         pthread_cond_signal(&queue->cond);
     }
@@ -121,7 +356,7 @@ rtpp_queue_pump(struct rtpp_queue *queue)
 {
 
     pthread_mutex_lock(&queue->mutex);
-    if (queue->length > 0) {
+    if (rtpp_queue_getclen(queue) > 0) {
         /* notify worker thread */
         pthread_cond_signal(&queue->cond);
     }
@@ -135,14 +370,24 @@ rtpp_queue_get_item(struct rtpp_queue *queue, int return_on_wake)
     struct rtpp_wi *wi;
 
     pthread_mutex_lock(&queue->mutex);
-    while (queue->head == NULL) {
+    while (rtpp_queue_getclen(queue) == 0) {
         pthread_cond_wait(&queue->cond, &queue->mutex);
-        if (queue->head == NULL && return_on_wake != 0) {
+        if (rtpp_queue_getclen(queue) == 0 && return_on_wake != 0) {
             pthread_mutex_unlock(&queue->mutex);
             return (NULL);
         }
     }
+#ifdef RTPQ_DEBUG
+    assert(rtpp_queue_getclen(queue) > 0);
+#endif
+    if (circ_buf_pop(&queue->circb, &wi) == 0) {
+        pthread_mutex_unlock(&queue->mutex);
+        return (wi);
+    }
     wi = queue->head;
+#ifdef RTPQ_DEBUG
+    assert(rtpp_queue_getclen(queue) > 0);
+#endif
     RTPPQ_REMOVE_HEAD(queue);
     pthread_mutex_unlock(&queue->mutex);
     wi->next = NULL;
@@ -153,26 +398,34 @@ rtpp_queue_get_item(struct rtpp_queue *queue, int return_on_wake)
 int
 rtpp_queue_get_items(struct rtpp_queue *queue, struct rtpp_wi **items, int ilen, int return_on_wake)
 {
-    int i;
+    int i, j;
 
     pthread_mutex_lock(&queue->mutex);
-    while (queue->head == NULL) {
+    while (rtpp_queue_getclen(queue) == 0) {
         pthread_cond_wait(&queue->cond, &queue->mutex);
-        if (queue->head == NULL && return_on_wake != 0) {
+        if (rtpp_queue_getclen(queue) == 0 && return_on_wake != 0) {
             pthread_mutex_unlock(&queue->mutex);
             return (0);
         }
     }
-    for (i = 0; i < ilen; i++) {
-        items[i] = queue->head;
-        queue->head = items[i]->next;
+    /* Pull out of circular buffer first */
+    i = circ_buf_popmany(&queue->circb, items, ilen);
+    if ((i == ilen) || (queue->length == 0))
+        goto done;
+    items += i;
+    ilen -= i;
+    for (j = 0; j < ilen; j++) {
+        items[j] = queue->head;
+        queue->head = items[j]->next;
         if (queue->head == NULL) {
             queue->tail = NULL;
-            i += 1;
+            j += 1;
             break;
         }
     }
-    queue->length -= i;
+    queue->length -= j;
+    i += j;
+done:
     pthread_mutex_unlock(&queue->mutex);
 
     return (i);
@@ -184,11 +437,12 @@ rtpp_queue_get_length(struct rtpp_queue *queue)
     int length;
 
     pthread_mutex_lock(&queue->mutex);
-    length = queue->length;
+    length = rtpp_queue_getclen(queue);
     pthread_mutex_unlock(&queue->mutex);
     return (length);
 }
 
+#if 0
 int
 rtpp_queue_count_matching(struct rtpp_queue *queue, rtpp_queue_match_fn_t match_fn, void *fn_args)
 {
@@ -205,13 +459,24 @@ rtpp_queue_count_matching(struct rtpp_queue *queue, rtpp_queue_match_fn_t match_
     pthread_mutex_unlock(&queue->mutex);
     return (mcnt);
 }
+#endif
 
 struct rtpp_wi *
 rtpp_queue_get_first_matching(struct rtpp_queue *queue, rtpp_queue_match_fn_t match_fn, void *fn_args)
 {
     struct rtpp_wi *wi, *wi_prev;
+    int i;
 
     pthread_mutex_lock(&queue->mutex);
+    for (i = 0;; i++) {
+        if (circ_buf_peek(&queue->circb, i, &wi) != 0)
+            break;
+        if (match_fn(wi, fn_args) == 0) {
+            assert(circ_buf_remove(&queue->circb, i) == 0);
+            pthread_mutex_unlock(&queue->mutex);
+            return (wi);
+        }
+    }
     wi_prev = NULL;
     for (wi = queue->head; wi != NULL; wi_prev = wi, wi = wi->next) {
         if (match_fn(wi, fn_args) == 0) {

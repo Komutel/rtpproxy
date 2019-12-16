@@ -45,6 +45,7 @@
 #include <getopt.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -58,11 +59,13 @@
 # include <err.h>
 #endif
 
+#include "rtpp_types.h"
 #include "format_au.h"
 #include "g711.h"
 #include "rtp_info.h"
 #include "decoder.h"
 #include "session.h"
+#include "rtpp_record_adhoc.h"
 #include "rtpp_record_private.h"
 #include "rtpp_ssrc.h"
 #include "rtp_analyze.h"
@@ -90,15 +93,31 @@ const static struct option longopts[] = {
     { NULL,           0,                 NULL, 0 }
 };
 
+#ifdef RTPP_CHECK_LEAKS
+#include "libexecinfo/stacktraverse.h"
+#include "libexecinfo/execinfo.h"
+#include "rtpp_memdeb_internal.h"
+
+RTPP_MEMDEB_APP_STATIC;
+#endif
+
+const static char *usage_msg[8] = {
+  "%s\n%s\n%s\n%s\n%s\n%s\n%s\n",
+  "usage: extractaudio [-idsn] [-F file_fmt] [-D data_fmt] rdir outfile",
+  "                    [link1] ... [linkN]",
+  "       extractaudio [-idsn] [-F file_fmt] [-D data_fmt] [-A answer_cap]",
+  "                    [-B originate_cap] [--alice-crypto CSPEC]",
+  "                    [--bob-crypto CSPEC] outfile [link1] ... [linkN]",
+  "       extractaudio -S [-A answer_cap] [-B originate_cap]",
+  "       extractaudio -S rdir"
+};
+
 static void
 usage(void)
 {
 
-    fprintf(stderr, "usage: extractaudio [-idsn] [-F file_fmt] [-D data_fmt] "
-      "rdir outfile [link1] ... [linkN]\n"
-                    "       extractaudio [-idsn] [-F file_fmt] [-D data_fmt] "
-      "[-A answer_cap] [-B originate_cap] [--alice-crypto CSPEC] [--bob-crypto CSPEC] "
-      "outfile [link1] ... [linkN]\n");
+    fprintf(stderr, usage_msg[0], usage_msg[1], usage_msg[2], usage_msg[3],
+      usage_msg[4], usage_msg[5], usage_msg[6], usage_msg[7]);
     exit(1);
 }
 
@@ -118,13 +137,14 @@ session_lookup(struct channels *channels, uint32_t ssrc, struct channel **cpp)
 }
 
 /* Insert channel keeping them ordered by time of first packet arrival */
-void
+int
 channel_insert(struct channels *channels, struct channel *channel)
 {
     struct cnode *cnp, *nnp;
 
     nnp = malloc(sizeof(*nnp));
-    assert(nnp != NULL);
+    if (nnp == NULL)
+        return (-1);
     memset(nnp, 0, sizeof(*nnp));
     nnp->cp = channel;
 
@@ -132,9 +152,10 @@ channel_insert(struct channels *channels, struct channel *channel)
         if (MYQ_FIRST(&(cnp->cp->session))->pkt->time <
           MYQ_FIRST(&(channel->session))->pkt->time) {
             MYQ_INSERT_AFTER(channels, cnp, nnp);
-            return;
+            return 0;
         }
     MYQ_INSERT_HEAD(channels, nnp);
+    return 0;
 }
 
 void
@@ -158,7 +179,8 @@ load_session(const char *path, struct channels *channels, enum origin origin,
     if (loader == NULL)
         return -1;
 
-    rtpp_stats_init(&stat);
+    if (rtpp_stats_init(&stat) < 0)
+        goto e0;
     pcount = loader->load(loader, channels, &stat, origin, crypto);
 
     update_rtpp_totals(&stat, &stat);
@@ -177,6 +199,27 @@ load_session(const char *path, struct channels *channels, enum origin origin,
     rtpp_stats_destroy(&stat);
 
     return pcount;
+e0:
+    loader->destroy(loader);
+    return -1;
+}
+
+static int
+scan_session(const char *path)
+{
+    int pcount;
+    struct rtpp_loader *loader;
+
+    loader = rtpp_load(path);
+    if (loader == NULL)
+        goto e0;
+
+    pcount = loader->scan(loader, NULL);
+    loader->destroy(loader);
+
+    return pcount;
+e0:
+    return -1;
 }
 
 int
@@ -197,13 +240,17 @@ main(int argc, char **argv)
     double basetime;
     SF_INFO sfinfo;
     SNDFILE *sffile;
-    int dflags;
+    int dflags, nloaded;
     const struct supported_fmt *sf_of;
     uint32_t use_file_fmt, use_data_fmt;
     uint32_t dflt_file_fmt, dflt_data_fmt;
     int option_index;
     struct eaud_crypto *alice_crypto, *bob_crypto;
     int64_t isample, sync_sample;
+
+#ifdef RTPP_CHECK_LEAKS
+    RTPP_MEMDEB_APP_INIT();
+#endif
 
     MYQ_INIT(&channels);
     MYQ_INIT(&act_subset);
@@ -220,8 +267,9 @@ main(int argc, char **argv)
     alice_crypto = bob_crypto = NULL;
     isample = -1;
     sync_sample = 0;
+    int scanonly = 0;
 
-    while ((ch = getopt_long(argc, argv, "dsinF:D:A:B:U:", longopts,
+    while ((ch = getopt_long(argc, argv, "dsSinF:D:A:B:U:", longopts,
       &option_index)) != -1)
         switch (ch) {
         case 'd':
@@ -291,6 +339,10 @@ main(int argc, char **argv)
             break;
 #endif
 
+        case 'S':
+            scanonly = 1;
+            break;
+
         case '?':
         default:
             usage();
@@ -299,9 +351,9 @@ main(int argc, char **argv)
     argv += optind;
 
     if (aname == NULL && bname == NULL) {
-        if (argc < 2)
+        if ((argc < 2 && !scanonly) || (scanonly && argc != 1))
             usage();
-    } else if (argc == 0) {
+    } else if ((argc == 0 && !scanonly) || (scanonly && argc != 0)) {
         usage();
     }
 
@@ -331,11 +383,29 @@ main(int argc, char **argv)
         argc -= 1;
     }
 
+    if (scanonly) {
+        if (aname != NULL) {
+            printf("%s: %d\n", aname, scan_session(aname));
+        }
+        if (bname != NULL) {
+            printf("%s: %d\n", bname, scan_session(bname));
+        }
+        exit (0);
+    }
+
+    nloaded = 0;
     if (aname != NULL) {
-        load_session(aname, &channels, A_CH, alice_crypto);
+        if (load_session(aname, &channels, A_CH, alice_crypto) >= 0) {
+            nloaded += 1;
+        }
     }
     if (bname != NULL) {
-        load_session(bname, &channels, B_CH, bob_crypto);
+        if (load_session(bname, &channels, B_CH, bob_crypto) >= 0) {
+            nloaded += 1;
+        }
+    }
+    if (nloaded == 0) {
+       errx(1, "cannot load neither %s nor %s", aname, bname);
     }
 
     if (MYQ_EMPTY(&channels))
@@ -358,6 +428,8 @@ main(int argc, char **argv)
     MYQ_FOREACH(cnp, &channels) {
         cnp->cp->skip = (cnp->cp->btime - basetime) * 8000;
         cnp->cp->decoder = decoder_new(&(cnp->cp->session), dflags);
+        if (cnp->cp->decoder == NULL)
+            err(1, "decoder_new() failed");
         nch++;
     }
 
@@ -381,7 +453,8 @@ main(int argc, char **argv)
         if ((dflags & D_FLAG_NOSYNC) == 1) {
             ap = &channels;
         } else if (sync_sample == isample) {
-            eaud_ss_syncactive(&channels, &act_subset, isample, &sync_sample);
+            if (eaud_ss_syncactive(&channels, &act_subset, isample, &sync_sample) < 0)
+                errx(1, "eaud_ss_syncactive() failed");
             ap = &act_subset;
         }
         MYQ_FOREACH(cnp, ap) {

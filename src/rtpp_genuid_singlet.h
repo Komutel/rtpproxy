@@ -26,5 +26,6 @@
  *
  */
 
-void rtpp_gen_uid_init(void);
+int rtpp_gen_uid_init(void);
+void rtpp_gen_uid_free(void);
 void rtpp_gen_uid(uint64_t *);

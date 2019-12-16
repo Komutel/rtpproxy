@@ -30,13 +30,13 @@
 #include <netinet/in.h>
 #include <stdlib.h>
 
-#include "rtpp_defines.h"
-#include "rtpp_cfg_stable.h"
+#include "rtpp_cfg.h"
 #include "rtpp_types.h"
 #include "rtpp_refcnt.h"
 #include "rtpp_weakref.h"
 #include "rtpp_hash_table.h"
 #include "rtp.h"
+#include "rtpp_time.h"
 #include "rtp_packet.h"
 #include "rtpp_proc.h"
 #include "rtpp_proc_servers.h"
@@ -75,7 +75,7 @@ process_rtp_servers_foreach(void *dp, void *ap)
         if (pkt == NULL) {
             if (len == RTPS_EOF) {
                 CALL_SMETHOD(rsop, finish_playback, rsrv->sruid);
-                CALL_SMETHOD(rsop->rcnt, decref);
+                RTPP_OBJ_DECREF(rsop);
                 return (RTPP_WR_MATCH_DEL);
             } else if (len != RTPS_LATER) {
                 /* XXX some error, brag to logs */
@@ -84,18 +84,18 @@ process_rtp_servers_foreach(void *dp, void *ap)
         }
         if (CALL_SMETHOD(rsop, issendable) == 0) {
             /* We have a packet, but nowhere to send it, drop */
-            rtp_packet_free(pkt);
+            RTPP_OBJ_DECREF(pkt);
             continue;
         }
         CALL_SMETHOD(rsop, send_pkt, fap->sender, pkt);
         fap->rsp->npkts_played.cnt++;
     }
-    CALL_SMETHOD(rsop->rcnt, decref);
+    RTPP_OBJ_DECREF(rsop);
     return (RTPP_WR_MATCH_CONT);
 }
 
 void
-rtpp_proc_servers(struct cfg *cf, double dtime, struct sthread_args *sender,
+rtpp_proc_servers(const struct rtpp_cfg *cfsp, double dtime, struct sthread_args *sender,
   struct rtpp_proc_rstats *rsp)
 {
     struct foreach_args fargs;
@@ -103,9 +103,9 @@ rtpp_proc_servers(struct cfg *cf, double dtime, struct sthread_args *sender,
     fargs.dtime = dtime;
     fargs.sender = sender;
     fargs.rsp = rsp;
-    fargs.rtp_streams_wrt = cf->stable->rtp_streams_wrt;
-    fargs.rtcp_streams_wrt = cf->stable->rtcp_streams_wrt;
+    fargs.rtp_streams_wrt = cfsp->rtp_streams_wrt;
+    fargs.rtcp_streams_wrt = cfsp->rtcp_streams_wrt;
 
-    CALL_METHOD(cf->stable->servers_wrt, foreach, process_rtp_servers_foreach,
+    CALL_METHOD(cfsp->servers_wrt, foreach, process_rtp_servers_foreach,
       &fargs);
 }

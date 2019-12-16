@@ -1,5 +1,3 @@
-#!/usr/bin/env python2
-#
 # Copyright (c) 2015 Sippy Software, Inc. All rights reserved.
 #
 # All rights reserved.
@@ -27,8 +25,7 @@
 
 import sys
 import getopt
-
-from twisted.internet import reactor
+from signal import SIGTERM
 
 DEFAULT_RTPP_SPATH = 'unix:/var/run/rtpproxy.sock'
 
@@ -39,17 +36,21 @@ class cli_handler(object):
     def __init__(self, file_out):
         self.file_out = file_out
 
-    def command_received(self, clm, cmd):
+    def command_received(self, x, clm, cmd):
         try:
-            self.file_out.write(cmd + '\n')
+            self.file_out.write('%s\n' % (cmd,))
             self.file_out.flush()
         except:
             self.rval = 1
-            reactor.crash()
+            clm.shutdown()
+            ED2.breakLoop()
             return
 
     def done(self):
-        reactor.crash()
+        ED2.breakLoop()
+
+    def sigin(self):
+        Timeout(self.done, 0.125)
 
 if __name__ == '__main__':
     spath = DEFAULT_RTPP_SPATH
@@ -86,7 +87,7 @@ if __name__ == '__main__':
            if fname == '-':
                file_out = sys.stdout
            else:
-               file_out = file(fname, 'w')
+               file_out = open(fname, 'w')
         if o == '-t':
            timeout = float(a.strip())
            continue
@@ -94,16 +95,19 @@ if __name__ == '__main__':
     if sippy_path != None:
         sys.path.insert(0, sippy_path)
 
-    from sippy.Cli_server_local import Cli_server_local
-    from sippy.Cli_server_tcp import Cli_server_tcp
-    from sippy.Timeout import Timeout
+    from sippy.CLIManager import CLIConnectionManager
+    from sippy.Time.Timeout import Timeout
+    from sippy.Core.EventDispatcher import ED2
 
     ch = cli_handler(file_out)
     if stype == 'unix':
-        cs = Cli_server_local(ch.command_received, spath)
+        rep = lambda x, y: ch.command_received(spath, x, y)
+        cs = CLIConnectionManager(rep, spath, tcp = False)
     else:
-        cs = Cli_server_tcp(ch.command_received, spath)
+        rep = lambda x, y: ch.command_received(spath[0], x, y)
+        cs = CLIConnectionManager(rep, tuple(spath), tcp = True)
     if timeout != None:
         Timeout(ch.done, timeout)
-    reactor.run(installSignalHandlers = 1)
+    ED2.regSignal(SIGTERM, ch.sigin)
+    ED2.loop(freq = 1000.0)
     sys.exit(ch.rval)
